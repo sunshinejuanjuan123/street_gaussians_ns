@@ -8,10 +8,59 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, Union
 
-from gsplat._torch_impl import quat_to_rotmat
-from gsplat.project_gaussians import project_gaussians
-from gsplat.rasterize import rasterize_gaussians
-from gsplat.sh import num_sh_bases, spherical_harmonics
+from gsplat import project_gaussians, rasterize_gaussians, spherical_harmonics
+
+# gsplat API moved across versions; keep this import compatible.
+try:
+    from gsplat.cuda_legacy._torch_impl import quat_to_rotmat  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from gsplat.cuda._torch_impl import quat_to_rotmat  # type: ignore
+    except Exception:  # pragma: no cover
+        try:
+            from gsplat._torch_impl import quat_to_rotmat  # type: ignore
+        except Exception:  # pragma: no cover
+            def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:  # type: ignore
+                """Convert quaternion (x,y,z,w) to rotation matrix.
+
+                This is a fallback for gsplat import path changes.
+                """
+                if quat.shape[-1] != 4:
+                    raise ValueError(f"Expected quat [...,4], got {tuple(quat.shape)}")
+                q = quat / (quat.norm(dim=-1, keepdim=True) + 1e-12)
+                x, y, z, w = q.unbind(dim=-1)
+                xx, yy, zz = x * x, y * y, z * z
+                xy, xz, yz = x * y, x * z, y * z
+                wx, wy, wz = w * x, w * y, w * z
+                m00 = 1 - 2 * (yy + zz)
+                m01 = 2 * (xy - wz)
+                m02 = 2 * (xz + wy)
+                m10 = 2 * (xy + wz)
+                m11 = 1 - 2 * (xx + zz)
+                m12 = 2 * (yz - wx)
+                m20 = 2 * (xz - wy)
+                m21 = 2 * (yz + wx)
+                m22 = 1 - 2 * (xx + yy)
+                return torch.stack(
+                    [
+                        torch.stack([m00, m01, m02], dim=-1),
+                        torch.stack([m10, m11, m12], dim=-1),
+                        torch.stack([m20, m21, m22], dim=-1),
+                    ],
+                    dim=-2,
+                )
+
+try:
+    from gsplat.cuda_legacy._wrapper import num_sh_bases  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from gsplat.cuda._wrapper import num_sh_bases  # type: ignore
+    except Exception:  # pragma: no cover
+        try:
+            from gsplat._wrapper import num_sh_bases  # type: ignore
+        except Exception:  # pragma: no cover
+            def num_sh_bases(degree: int) -> int:  # type: ignore
+                return (int(degree) + 1) ** 2
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
 from typing_extensions import Literal
@@ -839,6 +888,15 @@ class SplatfactoModel(Model):
         cy = camera.cy.item()
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
+        fovx = 2 * math.atan(W / (2 * camera.fx))
+        fovy = 2 * math.atan(H / (2 * camera.fy))
+        projmat = projection_matrix(0.001, 1000, fovx, fovy, device=self.device)
+        block_size = self.config.block_width
+        tile_bounds = (
+            int((W + block_size - 1) // block_size),
+            int((H + block_size - 1) // block_size),
+            1,
+        )
 
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]
@@ -857,19 +915,20 @@ class SplatfactoModel(Model):
         scales_crop = torch.exp(scales_crop)
         colors_crop = torch.cat((features_dc_crop, features_rest_crop), dim=1)
 
-        self.xys, self.depths, self.radii, self.conics, _, self.num_tiles_hit, _ = project_gaussians(  # type: ignore
+        self.xys, self.depths, self.radii, self.conics, self.num_tiles_hit, _ = project_gaussians(  # type: ignore
             means_crop,
             scales_crop,
             1,
             quats_crop / quats_crop.norm(dim=-1, keepdim=True),
             viewmat.squeeze()[:3, :],
+            projmat.squeeze() @ viewmat.squeeze(),
             camera.fx.item(),
             camera.fy.item(),
             cx,
             cy,
             H,
             W,
-            self.config.block_width,
+            tile_bounds,
         )  # type: ignore
 
         if self.config.use_sky_sphere:
@@ -927,7 +986,10 @@ class SplatfactoModel(Model):
         radii = gaussian_attrs['radii']
         conics = gaussian_attrs['conics']
         num_tiles_hit = gaussian_attrs['num_tiles_hit']
-        W, H = camera.width.item(), camera.height.item()
+        if getattr(self, "last_size", None) is not None:
+            H, W = self.last_size
+        else:
+            W, H = int(camera.width.item()), int(camera.height.item())
         background = self.back_color.to(self.device)
     
         if self.config.sh_degree > 0:
@@ -951,7 +1013,7 @@ class SplatfactoModel(Model):
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
         if 'rgb' in output_names or 'accumulation' in output_names:
-            rgb, alpha = rasterize_gaussians(  # type: ignore
+            rgb = rasterize_gaussians(  # type: ignore
                 xys,
                 depths,
                 radii,
@@ -961,14 +1023,30 @@ class SplatfactoModel(Model):
                 opacities,
                 H,
                 W,
-                self.config.block_width,
                 background=background,
-                return_alpha=True,
             )  # type: ignore
-            alpha = alpha[..., None]
+            alpha = rasterize_gaussians(  # type: ignore
+                xys,
+                depths,
+                radii,
+                conics,
+                num_tiles_hit,
+                torch.ones((opacities.shape[0], 3), device=opacities.device, dtype=opacities.dtype),
+                opacities,
+                H,
+                W,
+                background=torch.zeros(3, device=self.device),
+            )[..., 0:1]  # type: ignore
             rgb = torch.clamp(rgb, max=1.0)  # type: ignore
 
             if 'sky_capture' in gaussian_attrs:
+                if sky_capture.shape[0] != H or sky_capture.shape[1] != W:
+                    sky_capture = F.interpolate(
+                        sky_capture.permute(2, 0, 1)[None],
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0].permute(1, 2, 0)
                 rgb = rgb * alpha + sky_capture * (1 - alpha)
 
             if not self.training:
@@ -989,8 +1067,7 @@ class SplatfactoModel(Model):
                 opacities,
                 H,
                 W,
-                self.config.block_width,
-                torch.zeros(3, device=self.device),
+                background=torch.zeros(3, device=self.device),
             )[..., 0:1]
             depth_im = torch.where(alpha > 1e-3, depth_im / alpha, 10)
             outputs['depth'] = depth_im
@@ -1019,14 +1096,8 @@ class SplatfactoModel(Model):
             outputs: the output to compute loss dict to
             batch: ground truth batch corresponding to outputs
         """
-        d = self._get_downscale_factor()
-        if d > 1:
-            newsize = (int(math.ceil(batch["image"].shape[0] / d)), int(math.ceil(batch["image"].shape[1] / d)))
-            gt_img = TF.resize(batch["image"].permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
-        else:
-            gt_img = batch["image"]
         metrics_dict = {}
-        gt_rgb = gt_img.to(self.device)
+        gt_rgb = self.get_gt_img(batch["image"])
         predicted_rgb = outputs["rgb"]
         metrics_dict["psnr"] = self.psnr(predicted_rgb, gt_rgb)
         metrics_dict["gaussian_count"] = self.num_points
@@ -1051,10 +1122,10 @@ class SplatfactoModel(Model):
         d = self._get_downscale_factor()
         mask = None
         gt_semantic = None
+        gt_img = self.get_gt_img(batch["image"])
 
         if self.training and d > 1:
             newsize = (int(math.ceil(batch["image"].shape[0] / d)), int(math.ceil(batch["image"].shape[1] / d)))
-            gt_img = TF.resize(batch["image"].permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
             if "mask" in batch:
                 mask = TF.resize(
                     batch["mask"].permute(2, 0, 1),
@@ -1070,7 +1141,6 @@ class SplatfactoModel(Model):
                     interpolation=TF.InterpolationMode.NEAREST
                 ).permute(1, 2, 0)
         else:
-            gt_img = batch["image"]
             if "mask" in batch:
                 mask = batch["mask"]
             if "semantic" in batch:

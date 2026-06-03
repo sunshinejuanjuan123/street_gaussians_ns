@@ -5,7 +5,7 @@ from typing import Dict, List, Type, Union
 import copy
 import math
 
-from gsplat.sh import spherical_harmonics
+from gsplat import spherical_harmonics
 from pytorch3d.transforms import quaternion_multiply
 from torch.nn import Parameter
 import mediapy as media
@@ -320,36 +320,37 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         object_means = []
         object_quats = []
         object_features_dc = []
-        assert camera.times is not None
+        # Some datasets (or dataparsers) may not provide per-frame timestamps.
+        # In that case we gracefully fall back to background-only rendering/training.
+        has_time = camera.times is not None
 
         self.visible_model_names = ["background"]
-        annos_t: List[Box] = self.object_annos[camera.times.item()] #type: ignore
-        timestamp = parse_timestamp(camera.times.item())
-        exist_frame = False
-        if timestamp in self.object_annos.all_names:
-            exist_frame = True
-        if annos_t is not None and len(annos_t):
-            for anno in annos_t:
-                trackId = anno.trackId
-                model_name = self.get_object_model_name(trackId)
-                assert model_name not in self.visible_model_names
-                obj_model = self.all_models[model_name]
-                # prevent empty object
-                if obj_model.num_points == 0:
-                    continue
-                if exist_frame:
-                    self.bbox_optimizer.apply_to_bbox(anno)
-                # add fourier features of time
-                if self.config.fourier_features_dim > 1:
-                    object_features_dc.append(self.get_fourier_features(anno.frame, trackId, obj_model))
-                else:
-                    object_features_dc.append(obj_model.features_dc)
-                # aggregate all models properties for splatting
-                self.visible_model_names.append(model_name)
-                obj_means, obj_quats = object2world_gs(
-                    obj_model.means, obj_model.quats, anno.center, anno.rot)
-                object_means.append(obj_means)
-                object_quats.append(obj_quats)
+        if has_time:
+            annos_t: List[Box] = self.object_annos[camera.times.item()]  # type: ignore
+            timestamp = parse_timestamp(camera.times.item())
+            exist_frame = timestamp in self.object_annos.all_names
+
+            if annos_t is not None and len(annos_t):
+                for anno in annos_t:
+                    trackId = anno.trackId
+                    model_name = self.get_object_model_name(trackId)
+                    assert model_name not in self.visible_model_names
+                    obj_model = self.all_models[model_name]
+                    # prevent empty object
+                    if obj_model.num_points == 0:
+                        continue
+                    if exist_frame:
+                        self.bbox_optimizer.apply_to_bbox(anno)
+                    # add fourier features of time
+                    if self.config.fourier_features_dim > 1:
+                        object_features_dc.append(self.get_fourier_features(anno.frame, trackId, obj_model))
+                    else:
+                        object_features_dc.append(obj_model.features_dc)
+                    # aggregate all models properties for splatting
+                    self.visible_model_names.append(model_name)
+                    obj_means, obj_quats = object2world_gs(obj_model.means, obj_model.quats, anno.center, anno.rot)
+                    object_means.append(obj_means)
+                    object_quats.append(obj_quats)
 
         # render all models
         self.means = torch.cat([self.background_model.means, *object_means], dim=0)

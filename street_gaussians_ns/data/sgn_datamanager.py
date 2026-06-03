@@ -259,6 +259,10 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         cameras = []
         for i in image_indices:
             data[i]["image"] = data[i]["image"].to(self.device)
+            if "mask" in data[i]:
+                data[i]["mask"] = data[i]["mask"].to(self.device)
+            if "semantic" in data[i]:
+                data[i]["semantic"] = data[i]["semantic"].to(self.device)
             cameras.append(_cameras[i : i + 1])
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         return list(zip(cameras, data))
@@ -285,6 +289,10 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
 
         data = deepcopy(self.cached_train[image_idx])
         data["image"] = data["image"].to(self.device)
+        if "mask" in data:
+            data["mask"] = data["mask"].to(self.device)
+        if "semantic" in data:
+            data["semantic"] = data["semantic"].to(self.device)
         assert len(self.train_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.train_dataset.cameras[image_idx : image_idx + 1].to(self.device)
         if camera.metadata is None:
@@ -302,6 +310,10 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
         data = deepcopy(self.cached_eval[image_idx])
         data["image"] = data["image"].to(self.device)
+        if "mask" in data:
+            data["mask"] = data["mask"].to(self.device)
+        if "semantic" in data:
+            data["semantic"] = data["semantic"].to(self.device)
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
         return camera, data
@@ -318,6 +330,10 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
         data = deepcopy(self.cached_eval[image_idx])
         data["image"] = data["image"].to(self.device)
+        if "mask" in data:
+            data["mask"] = data["mask"].to(self.device)
+        if "semantic" in data:
+            data["semantic"] = data["semantic"].to(self.device)
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
         return camera, data

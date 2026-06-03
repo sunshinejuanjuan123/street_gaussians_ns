@@ -102,8 +102,8 @@ class ColmapDataParserConfig(DataParserConfig):
     """The specified data will be forcely saved or updated after undistorting."""
     load_dynamic_annotations: bool = False
     """Whether to load dynamic annotations."""
-    frame_select=[100,190]
-    """Frame selection for dynamic annotations."""
+    frame_select: Optional[List[int]] = None
+    """Frame selection per camera when filter_camera_id is set."""
 
 
 class ColmapDataParser(DataParser):
@@ -220,8 +220,11 @@ class ColmapDataParser(DataParser):
             out["applied_transform"] = applied_transform.tolist()
         out["camera_model"] = camera_model
         if meta:
-            # Colmap is run after this translation to all poses. 
-            first_frame_pose = np.array(meta["frames"][0]["transform_matrix"])[:3,3]
+            # Colmap is run after this translation to all poses.
+            if meta["frames"] and "transform_matrix" in meta["frames"][0]:
+                first_frame_pose = np.array(meta["frames"][0]["transform_matrix"])[:3, 3]
+            else:
+                first_frame_pose = np.array(frames[0]["transform_matrix"])[:3, 3]
             out["applied_translation_in_colmap"] = (-first_frame_pose * 0.98).tolist()
         assert len(frames) > 0, "No images found in the colmap model"
         return out
@@ -257,7 +260,7 @@ class ColmapDataParser(DataParser):
             raise RuntimeError(f"The dataset's list of filenames for split {split} is missing.")
         else:
             # filter image_filenames and poses based on train/eval split percentage
-            if self.config.frame_select is not None:
+            if self.config.frame_select is not None and self.config.filter_camera_id:
                 _, counts = torch.unique(camera_ids, return_counts=True)
                 frame_len = counts[0]
                 all_idx_list = []
@@ -443,13 +446,14 @@ class ColmapDataParser(DataParser):
             # Load 3D points
             metadata.update(self._load_3D_points(colmap_path, transform_matrix, scale_factor))
         if self.config.load_dynamic_annotations:
-            translation = meta["applied_translation_in_colmap"]
-            translation = gl2cv(np.append(translation, 1))
-            # get 4x4 matrix
-            transform_matrix_colmap = np.eye(4)
-            transform_matrix_colmap[:3,3] = translation[:3]
-            # Load dynamic annotations
-            transform_matrix_anno = transform_matrix.numpy() @ transform_matrix_colmap
+            if "applied_translation_in_colmap" in meta:
+                translation = meta["applied_translation_in_colmap"]
+                translation = gl2cv(np.append(translation, 1))
+                transform_matrix_colmap = np.eye(4)
+                transform_matrix_colmap[:3, 3] = translation[:3]
+                transform_matrix_anno = transform_matrix.numpy() @ transform_matrix_colmap
+            else:
+                transform_matrix_anno = transform_matrix.numpy()
             metadata.update({"object_annos":InterpolatedAnnotation(
                 anno_json_path=self.config.data / 'annotation.json',
                 lidar_path=self.config.data / 'aggregate_lidar' / 'dynamic_objects',
