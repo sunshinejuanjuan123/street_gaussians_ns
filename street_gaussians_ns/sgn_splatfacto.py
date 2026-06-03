@@ -471,13 +471,46 @@ class SplatfactoModel(Model):
     def opacities(self):
         del self.gauss_params.opacities
 
+    @staticmethod
+    def _normalize_gauss_params_state_dict(state_dict: dict) -> None:
+        """Remap checkpoint keys to gauss_params.* (flat, legacy, or prefixed)."""
+        param_names = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        if "gauss_params.means" in state_dict:
+            return
+        if "means" in state_dict:
+            for p in param_names:
+                if p in state_dict:
+                    state_dict[f"gauss_params.{p}"] = state_dict[p]
+            return
+        means_key = next(
+            (k for k in state_dict if k.endswith("gauss_params.means")),
+            None,
+        )
+        if means_key is not None:
+            prefix = means_key[: -len("gauss_params.means")]
+            for p in param_names:
+                src = f"{prefix}gauss_params.{p}"
+                if src in state_dict:
+                    state_dict[f"gauss_params.{p}"] = state_dict.pop(src)
+            return
+        means_key = next((k for k in state_dict if k.endswith(".means")), None)
+        if means_key is not None:
+            prefix = means_key[: -len("means")]
+            for p in param_names:
+                for src in (f"{prefix}gauss_params.{p}", f"{prefix}{p}"):
+                    if src in state_dict:
+                        state_dict[f"gauss_params.{p}"] = state_dict.pop(src)
+                        break
+
     def load_state_dict(self, dict, **kwargs):  # type: ignore
         # resize the parameters to match the new number of points
-        if "means" in dict:
-            # For backwards compatibility, we remap the names of parameters from
-            # means->gauss_params.means since old checkpoints have that format
-            for p in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
-                dict[f"gauss_params.{p}"] = dict[p]
+        self._normalize_gauss_params_state_dict(dict)
+        if "gauss_params.means" not in dict:
+            sample = list(dict.keys())[:20]
+            raise KeyError(
+                "Could not find gaussian parameters in state_dict "
+                f"(expected gauss_params.means or means). Sample keys: {sample}"
+            )
         newp = dict["gauss_params.means"].shape[0]
         for name, param in self.gauss_params.items():
             old_shape = param.shape

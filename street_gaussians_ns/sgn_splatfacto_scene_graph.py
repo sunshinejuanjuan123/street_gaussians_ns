@@ -392,12 +392,33 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         return losses
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
+        # Pipeline.load_state_dict strips the "_model." prefix before calling the model.
+        # Checkpoints therefore use keys like "all_models.background.gauss_params.means".
+        def _has_gauss_params(state: dict) -> bool:
+            return (
+                "gauss_params.means" in state
+                or "means" in state
+                or any(k.endswith("gauss_params.means") for k in state)
+            )
+
+        # Single-model checkpoint: top-level gauss_params.* -> background only.
+        flat_gauss = {k: dict.pop(k) for k in list(dict) if k.startswith("gauss_params.")}
+        if flat_gauss and _has_gauss_params(flat_gauss):
+            self.all_models["background"].load_state_dict(flat_gauss, **kwargs)
+
         for model_name, model in self.all_models.items():
+            prefixes = (
+                f"all_models.{model_name}.",
+                f"{model_name}.",
+            )
             sub_dict = {}
             for key in list(dict.keys()):
-                if model_name in key:
-                    sub_dict[".".join(key.split(".")[2:])] = dict.pop(key)
-            model.load_state_dict(sub_dict, **kwargs)
+                for prefix in prefixes:
+                    if key.startswith(prefix):
+                        sub_dict[key[len(prefix) :]] = dict.pop(key)
+                        break
+            if sub_dict and _has_gauss_params(sub_dict):
+                model.load_state_dict(sub_dict, **kwargs)
         torch.nn.Module.load_state_dict(self, dict, strict=False)
 
 
