@@ -51,11 +51,11 @@ class ColmapDataParserConfig(DataParserConfig):
     """How much to scale the camera origins by."""
     downscale_factor: Optional[int] = None
     """How much to downscale images. If not set, images are chosen such that the max dimension is <1600px."""
-    scene_scale: float = 1.0
+    scene_scale: float = 1.0  # 1.0
     """How much to scale the region of interest by."""
-    orientation_method: Literal["pca", "up", "vertical", "none"] = "up"
+    orientation_method: Literal["pca", "up", "vertical", "none"] = "up" # up
     """The method to use for orientation."""
-    center_method: Literal["poses", "focus", "none"] = "poses"
+    center_method: Literal["poses", "focus", "none"] = "poses" # poses
     """The method to use to center the poses."""
     auto_scale_poses: bool = True
     """Whether to automatically scale the poses to fit in +/- 1 bounding box."""
@@ -73,7 +73,7 @@ class ColmapDataParserConfig(DataParserConfig):
     Interval uses every nth frame for eval (used by most academic papers, e.g. MipNerf360, GSplat).
     All uses all the images for any split.
     """
-    train_split_fraction: float = 0.9
+    train_split_fraction: float = 0.9 # 0.9
     """The fraction of images to use for training. The remaining images are for eval."""
     eval_interval: int = 8
     """The interval between frames to use for eval. Only used when eval_mode is eval-interval."""
@@ -83,8 +83,11 @@ class ColmapDataParserConfig(DataParserConfig):
     """Path to images directory relative to the data path."""
     masks_path: Optional[Path] = None
     """Path to masks directory. If not set, masks are not loaded."""
+    dynamic_masks_path: Optional[Path] = None
+    """Path to dynamic masks directory. If not set, dynamic masks are not loaded."""
     segments_path: Optional[Path] = None
     """Path to segments directory. If not set, segments are not loaded."""
+    depths_path: Optional[Path] = None
     colmap_path: Path = Path("colmap/sparse/0")
     """Path to the colmap reconstruction directory relative to the data path."""
     init_points_filename: str = "points3D.bin"
@@ -102,8 +105,8 @@ class ColmapDataParserConfig(DataParserConfig):
     """The specified data will be forcely saved or updated after undistorting."""
     load_dynamic_annotations: bool = False
     """Whether to load dynamic annotations."""
-    frame_select: Optional[List[int]] = None
-    """Frame selection per camera when filter_camera_id is set."""
+    frame_select= None
+    """Frame selection for dynamic annotations."""
 
 
 class ColmapDataParser(DataParser):
@@ -128,7 +131,7 @@ class ColmapDataParser(DataParser):
 
     config: ColmapDataParserConfig
     includes_time: bool = True
-    channel_names: List = ["image", "mask", "segment"]
+    channel_names: List = ["image", "mask", "segment", "depth", "dynamic_mask"]
 
     def __init__(self, config: ColmapDataParserConfig):
         super().__init__(config)
@@ -194,8 +197,9 @@ class ColmapDataParser(DataParser):
                 "colmap_im_id": im_id,
                 "camera_id": im_data.camera_id,
             }
-            if file2time:
-                frame["time"] = file2time[(self.config.images_path / im_data.name).as_posix()]
+
+            # create time stamp
+            frame["time"] = float(im_data.name.split("/")[-1][:-4])
             frame.update(cameras[im_data.camera_id])
 
             if self.config.masks_path is not None:
@@ -205,6 +209,14 @@ class ColmapDataParser(DataParser):
             if self.config.segments_path is not None:
                 frame["segment_path"] = (
                     (self.config.data / self.config.segments_path / im_data.name).with_suffix(".png").as_posix()
+                )
+            if self.config.depths_path is not None:
+                frame["depth_path"] = (
+                    (self.config.data / self.config.depths_path / im_data.name).with_suffix(".npz").as_posix()
+                )
+            if self.config.dynamic_masks_path is not None:
+                frame["dynamic_mask_path"] = (
+                    (self.config.data / self.config.dynamic_masks_path / im_data.name).with_suffix(".png").as_posix()
                 )
             frames.append(frame)
             camera_model.append(frame["camera_model"])
@@ -220,11 +232,8 @@ class ColmapDataParser(DataParser):
             out["applied_transform"] = applied_transform.tolist()
         out["camera_model"] = camera_model
         if meta:
-            # Colmap is run after this translation to all poses.
-            if meta["frames"] and "transform_matrix" in meta["frames"][0]:
-                first_frame_pose = np.array(meta["frames"][0]["transform_matrix"])[:3, 3]
-            else:
-                first_frame_pose = np.array(frames[0]["transform_matrix"])[:3, 3]
+            # Colmap is run after this translation to all poses. 
+            first_frame_pose = np.array(meta["frames"][0]["transform_matrix"])[:3,3]
             out["applied_translation_in_colmap"] = (-first_frame_pose * 0.98).tolist()
         assert len(frames) > 0, "No images found in the colmap model"
         return out
@@ -260,7 +269,7 @@ class ColmapDataParser(DataParser):
             raise RuntimeError(f"The dataset's list of filenames for split {split} is missing.")
         else:
             # filter image_filenames and poses based on train/eval split percentage
-            if self.config.frame_select is not None and self.config.filter_camera_id:
+            if self.config.frame_select is not None:
                 _, counts = torch.unique(camera_ids, return_counts=True)
                 frame_len = counts[0]
                 all_idx_list = []
@@ -285,7 +294,8 @@ class ColmapDataParser(DataParser):
             i_eval = np.setdiff1d(i_all, i_train)  # eval images are the remaining images
             assert len(i_eval) == num_eval_images
             if split == "train":
-                indices = all_idx[i_train]
+                # indices = all_idx[i_train]
+                indices = all_idx
             elif split in ["val", "test"]:
                 indices = all_idx[i_eval]
             elif split == "all":
@@ -301,8 +311,8 @@ class ColmapDataParser(DataParser):
 
         dataparser_outputs_path = self.config.data/"dataparser_transforms.json"
         meta = self._get_all_images_and_cameras(colmap_path)
+
         camera_type = torch.tensor([CAMERA_MODEL_TO_TYPE[model].value for model in meta["camera_model"]])
-        
         
         filenames = defaultdict(list) 
 
@@ -369,6 +379,8 @@ class ColmapDataParser(DataParser):
             poses = transform_matrix @ poses
             scale_factor = float(dataparser_outputs["scale"])
         else:
+            print("auto_orient_and_center_poses begin")
+
             poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
                 poses,
                 method=self.config.orientation_method,
@@ -381,6 +393,9 @@ class ColmapDataParser(DataParser):
                 scale_factor /= float(torch.max(torch.abs(poses[:, :3, 3])))
 
         scale_factor *= self.config.scale_factor
+
+        print("scale_factor:{}, {}".format(scale_factor, float(torch.max(torch.abs(poses[:, :3, 3])))))
+
         poses[:, :3, 3] *= scale_factor
 
         fx = torch.tensor(fx, dtype=torch.float32)
@@ -392,8 +407,10 @@ class ColmapDataParser(DataParser):
         distortion_params = torch.stack(distort, dim=0)
         camera_ids = torch.tensor(camera_ids, dtype=torch.uint8)
         camera_type = camera_type
+
         if times:
             times = torch.tensor(times, dtype=torch.float64)
+            self.includes_time = True
             # times = (times - times.min()) / (times.max() - times.min())
 
         cameras = Cameras(
@@ -446,14 +463,9 @@ class ColmapDataParser(DataParser):
             # Load 3D points
             metadata.update(self._load_3D_points(colmap_path, transform_matrix, scale_factor))
         if self.config.load_dynamic_annotations:
-            if "applied_translation_in_colmap" in meta:
-                translation = meta["applied_translation_in_colmap"]
-                translation = gl2cv(np.append(translation, 1))
-                transform_matrix_colmap = np.eye(4)
-                transform_matrix_colmap[:3, 3] = translation[:3]
-                transform_matrix_anno = transform_matrix.numpy() @ transform_matrix_colmap
-            else:
-                transform_matrix_anno = transform_matrix.numpy()
+            print("load dynamic annotations")
+            transform_matrix_anno = transform_matrix.numpy()
+
             metadata.update({"object_annos":InterpolatedAnnotation(
                 anno_json_path=self.config.data / 'annotation.json',
                 lidar_path=self.config.data / 'aggregate_lidar' / 'dynamic_objects',
@@ -472,6 +484,8 @@ class ColmapDataParser(DataParser):
             metadata={
                 "segment_filenames": filenames.get("segment", None),
                 "cameras": cameras,
+                "depth_filenames": filenames.get("depth", None),
+                "dynamic_mask_filenames": filenames.get("dynamic_mask", None),
                 **metadata,
             },
         )
@@ -755,3 +769,4 @@ class ColmapDataParser(DataParser):
         rel_part = filepath.relative_to(parent)
         base_part = parent.parent / f"{parent.name}{'_ud' if undistort else ''}{'_' + str(downscale_factor) if downscale_factor > 1 else ''}"
         return base_part / rel_part
+

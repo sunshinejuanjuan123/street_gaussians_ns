@@ -17,6 +17,17 @@ from street_gaussians_ns.data.utils.bbox_optimizers import BBoxOptimizerConfig
 from street_gaussians_ns.sgn_splatfacto import SplatfactoModelConfig
 from street_gaussians_ns.sgn_splatfacto_scene_graph import SplatfactoSceneGraphModelConfig
 
+import os
+
+env_value = os.getenv("STREET_GAUSSIANS_MAX_ITERATIONS", "").strip()
+
+try:
+    STREET_GAUSSIANS_MAX_ITERATIONS = int(env_value) if env_value else 30000
+except ValueError:
+    print(f"Warning: Invalid STREET_GAUSSIANS_MAX_ITERATIONS='{env_value}', using default value 30000.")
+    STREET_GAUSSIANS_MAX_ITERATIONS = 30000
+
+print(f"3DGS: STREET_GAUSSIANS_MAX_ITERATIONS={STREET_GAUSSIANS_MAX_ITERATIONS}")
 
 street_gaussians_ns_method = MethodSpecification(
     config=TrainerConfig(
@@ -24,10 +35,10 @@ street_gaussians_ns_method = MethodSpecification(
         steps_per_eval_image=500,
         steps_per_eval_batch=500,
         steps_per_save=2000,
-        steps_per_eval_all_images=30000, 
-        max_num_iterations=30000,
+        steps_per_eval_all_images=70000,
+        max_num_iterations=70000,
         mixed_precision=False,
-        gradient_accumulation_steps={"camera_opt": 100,'semantic':10},
+        gradient_accumulation_steps={"camera_opt": 100, 'semantic': 10},
         pipeline=VanillaPipelineConfig(
             datamanager=FullImageDatamanagerConfig(
                 dataparser=ColmapDataParserConfig(
@@ -48,11 +59,11 @@ street_gaussians_ns_method = MethodSpecification(
                 background_model=SplatfactoModelConfig(
                     cull_alpha_thresh=0.02,
                     cull_scale_thresh=0.2,
-                    # densify_grad_thresh=0.0002,
+                    # densify_grad_thresh=0.0001,
                     warmup_length=500,
                     refine_every=100,
                     reset_alpha_every=30,
-                    stop_split_at=25000,
+                    stop_split_at=50000,
                     fourier_features_dim=1,
                 ),
                 object_model_template=SplatfactoModelConfig(
@@ -62,42 +73,46 @@ street_gaussians_ns_method = MethodSpecification(
                     warmup_length=500,
                     refine_every=100,
                     reset_alpha_every=30,
-                    stop_split_at=25000,
+                    stop_split_at=50000,
                     fourier_features_dim=5,
                     num_random=10000,
                 )
             ),
         ),
         optimizers={
+            "bilateral_grid": {
+                "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=50000, warmup_steps=1000, lr_pre_warmup=0),
+            },
             "sky_sphere": {
-                "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
                 "scheduler": None,
             },
             "camera_opt": {
-                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=70000),
+                "optimizer": AdamOptimizerConfig(lr=1e-6, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-6, max_steps=70000),
             },
-            "bbox_opt":{
-                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+            "bbox_opt": {
+                "optimizer": AdamOptimizerConfig(lr=1e-6, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=70000),
             },
             "means": {
-                "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=1.6e-5, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1.6e-6,
+                    lr_final=1.6e-7,
                     max_steps=70000,
                 ),
             },
             "features_dc": {
-                "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
                 "scheduler": None,
             },
             "features_rest": {
-                "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=0.001 / 20, eps=1e-15),
                 "scheduler": None,
             },
             "opacities": {
-                "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
                 "scheduler": None,
             },
             "scales": {

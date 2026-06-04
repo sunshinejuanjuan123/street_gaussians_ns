@@ -232,7 +232,7 @@ class InterpolatedAnnotation:
         self.objects_meta = {}
         self.objects_frames = {}
         for i, item in enumerate(annos):
-            item['timestamp'] = parse_timestamp(item['timestamp'])
+            item['timestamp'] = parse_timestamp(item['timestamp']/1e9)
             self.annos[str(item['timestamp'])] = self.load_anno_json_one_frame(
                 item['objects'], item['timestamp'], i, filter_label=FILTER_LABEL, ignore_static=True)
 
@@ -309,7 +309,9 @@ class InterpolatedAnnotation:
         boxes = []
         for idx, obj in enumerate(obj_list):
             if filter_label is not None:
-                if obj['type'] not in filter_label and not obj['type'].endswith('Car'):
+                if obj['type'] not in ['Car', 'Truck']:
+                # if obj['type'] not in ['car', 'motorcycle', 'van', 'truck']:
+                # if obj['type'] not in ['car', 'pes']:
                     continue
             if ignore_static and not obj['is_moving']:
                 continue
@@ -353,7 +355,7 @@ class InterpolatedAnnotation:
         pcd = o3d.io.read_point_cloud(str(ply_path))
         # read points_xyz
         points3D = torch.from_numpy(np.array(pcd.points, dtype=np.float32))
-        if points3D.shape[0] < 10000:
+        if points3D.shape[0] < 8000: # 10000
             return None
         points3D *= self.scale_factor
         # Load point colours

@@ -5,7 +5,7 @@ from typing import Dict, List, Type, Union
 import copy
 import math
 
-from gsplat import spherical_harmonics
+# from gsplat.sh import spherical_harmonics
 from pytorch3d.transforms import quaternion_multiply
 from torch.nn import Parameter
 import mediapy as media
@@ -36,6 +36,7 @@ class SplatfactoSceneGraphModelConfig(SplatfactoModelConfig):
     """Bounding box optimizer config"""
     object_acc_entropy_loss_mult: float = 0.001
     """loss weight of object-background accumulation cross entropy loss"""
+    use_bilateral_grid: bool = False
 
 
 class SplatfactoSceneGraphModel(SplatfactoModel):
@@ -78,6 +79,7 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
             object_model_config = copy.deepcopy(self.config.object_model_template)
             object_model_config.use_sky_sphere = False
             object_model_config.sh_degree = self.config.sh_degree
+            object_model_config.use_bilateral_grid = False
             object_model_config.extent = torch.from_numpy(obj_meta.size).float() / 2
             self.all_models[self.get_object_model_name(obj_id)] = object_model_config.setup(
                 scene_box=self.scene_box,
@@ -123,6 +125,7 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         groups = super().get_param_groups()
         # add bbox optimizer param groups
         self.bbox_optimizer.get_param_groups(groups)
+        self.camera_optimizer.get_param_groups(groups)
         return groups
 
     def get_training_callbacks(
@@ -269,32 +272,15 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
             submodel_features_dc = torch.cat(object_features_dc, dim=0)
         submodel_opacities = self.aggregate_submodel_var("opacities", submodel_names)
         submodel_features_rest = self.aggregate_submodel_var("features_rest", submodel_names)
-        submodel_xys = self.aggregate_submodel_var("xys", submodel_names)
-        submodel_depths = self.aggregate_submodel_var("depths", submodel_names)
-        submodel_radii = self.aggregate_submodel_var("radii", submodel_names)
-        submodel_conics = self.aggregate_submodel_var("conics", submodel_names)
-        submodel_num_tiles_hit = self.aggregate_submodel_var("num_tiles_hit", submodel_names)
-        # render submodel
+        submodel_quats = self.aggregate_submodel_var("quats", submodel_names)
+        submodel_scales = self.aggregate_submodel_var("scales", submodel_names)
         colors = torch.cat((submodel_features_dc, submodel_features_rest), dim=1)
-        if self.config.sh_degree > 0:
-            viewdirs = submodel_means.detach() - camera.camera_to_worlds.detach()[..., :3, 3]  # (N, 3)
-            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
-            n = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
-            if not self.training:
-                n = self.config.sh_degree
-            rgbs = spherical_harmonics(n, viewdirs, colors)
-            rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
-        else:
-            rgbs = torch.sigmoid(colors[:, 0, :])
         gaussian_attrs = {
             "means": submodel_means,
+            "quats": submodel_quats,
+            "scales": submodel_scales,
             "colors": colors,
             "opacities": submodel_opacities,
-            "xys": submodel_xys,
-            "depths": submodel_depths,
-            "radii": submodel_radii,
-            "conics": submodel_conics,
-            "num_tiles_hit": submodel_num_tiles_hit,
         }
         if sky_capture is not None:
             gaussian_attrs["sky_capture"] = sky_capture
@@ -320,37 +306,37 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         object_means = []
         object_quats = []
         object_features_dc = []
-        # Some datasets (or dataparsers) may not provide per-frame timestamps.
-        # In that case we gracefully fall back to background-only rendering/training.
-        has_time = camera.times is not None
+        assert camera.times is not None
 
         self.visible_model_names = ["background"]
-        if has_time:
-            annos_t: List[Box] = self.object_annos[camera.times.item()]  # type: ignore
-            timestamp = parse_timestamp(camera.times.item())
-            exist_frame = timestamp in self.object_annos.all_names
+        annos_t: List[Box] = self.object_annos[camera.times.item()] #type: ignore
+        timestamp = parse_timestamp(camera.times.item())
+        exist_frame = False
+        if timestamp in self.object_annos.all_names:
+            exist_frame = True
+        if annos_t is not None and len(annos_t):
+            for anno in annos_t:
+                trackId = anno.trackId
+                model_name = self.get_object_model_name(trackId)
+                assert model_name not in self.visible_model_names
+                obj_model = self.all_models[model_name]
+                # prevent empty object
+                if obj_model.num_points == 0 or obj_model.num_points == 1:
+                    continue
+                if exist_frame:
+                    self.bbox_optimizer.apply_to_bbox(anno)
+                # add fourier features of time
+                if self.config.fourier_features_dim > 1:
+                    object_features_dc.append(self.get_fourier_features(anno.frame, trackId, obj_model))
+                else:
+                    object_features_dc.append(obj_model.features_dc)
+                # aggregate all models properties for splatting
+                self.visible_model_names.append(model_name)
 
-            if annos_t is not None and len(annos_t):
-                for anno in annos_t:
-                    trackId = anno.trackId
-                    model_name = self.get_object_model_name(trackId)
-                    assert model_name not in self.visible_model_names
-                    obj_model = self.all_models[model_name]
-                    # prevent empty object
-                    if obj_model.num_points == 0:
-                        continue
-                    if exist_frame:
-                        self.bbox_optimizer.apply_to_bbox(anno)
-                    # add fourier features of time
-                    if self.config.fourier_features_dim > 1:
-                        object_features_dc.append(self.get_fourier_features(anno.frame, trackId, obj_model))
-                    else:
-                        object_features_dc.append(obj_model.features_dc)
-                    # aggregate all models properties for splatting
-                    self.visible_model_names.append(model_name)
-                    obj_means, obj_quats = object2world_gs(obj_model.means, obj_model.quats, anno.center, anno.rot)
-                    object_means.append(obj_means)
-                    object_quats.append(obj_quats)
+                obj_means, obj_quats = object2world_gs(
+                    obj_model.means, obj_model.quats, anno.center, anno.rot)
+                object_means.append(obj_means)
+                object_quats.append(obj_quats)
 
         # render all models
         self.means = torch.cat([self.background_model.means, *object_means], dim=0)
@@ -392,33 +378,20 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         return losses
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
-        # Pipeline.load_state_dict strips the "_model." prefix before calling the model.
-        # Checkpoints therefore use keys like "all_models.background.gauss_params.means".
-        def _has_gauss_params(state: dict) -> bool:
-            return (
-                "gauss_params.means" in state
-                or "means" in state
-                or any(k.endswith("gauss_params.means") for k in state)
-            )
-
-        # Single-model checkpoint: top-level gauss_params.* -> background only.
-        flat_gauss = {k: dict.pop(k) for k in list(dict) if k.startswith("gauss_params.")}
-        if flat_gauss and _has_gauss_params(flat_gauss):
-            self.all_models["background"].load_state_dict(flat_gauss, **kwargs)
 
         for model_name, model in self.all_models.items():
-            prefixes = (
-                f"all_models.{model_name}.",
-                f"{model_name}.",
-            )
             sub_dict = {}
             for key in list(dict.keys()):
-                for prefix in prefixes:
-                    if key.startswith(prefix):
-                        sub_dict[key[len(prefix) :]] = dict.pop(key)
-                        break
-            if sub_dict and _has_gauss_params(sub_dict):
+                if "all_models" in key:
+                    key_name = key.split(".")[1]
+                    if model_name == key_name:
+                        sub_dict[".".join(key.split(".")[2:])] = dict.pop(key)
+            if len(sub_dict) != 0:
+                print(model_name)
                 model.load_state_dict(sub_dict, **kwargs)
+            else:
+                continue
+                
         torch.nn.Module.load_state_dict(self, dict, strict=False)
 
 
