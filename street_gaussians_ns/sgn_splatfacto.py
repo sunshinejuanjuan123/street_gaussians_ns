@@ -6,10 +6,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 from gsplat import spherical_harmonics
-from street_gaussians_ns.gsplat_compat import project_gaussians, rasterize_gaussians
+from street_gaussians_ns.gsplat_compat import (
+    load_ftheta_coeffs_from_json,
+    project_gaussians,
+    rasterize_gaussians,
+    rasterize_gaussians_3dgut,
+)
 
 
 def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:
@@ -276,6 +282,10 @@ class SplatfactoModelConfig(ModelConfig):
     """Resolution of the environment map used for the sky sphere."""
     block_width: int = 16
     """Block width used for the project and rasterize functions."""
+    render_camera_model: Literal["pinhole", "fisheye", "ftheta"] = "pinhole"
+    """Inference-only: use gsplat 3DGUT rasterization (fisheye/ftheta) instead of pinhole projection."""
+    ftheta_coeffs_path: Optional[Path] = None
+    """JSON file with FThetaCameraDistortionParameters for ftheta rendering."""
 
     use_bilateral_grid: bool = True
     grid_shape: Tuple[int, int, int] = (16, 16, 8)
@@ -493,7 +503,10 @@ class SplatfactoModel(Model):
             old_shape = param.shape
             new_shape = (newp,) + old_shape[1:]
             self.gauss_params[name] = torch.nn.Parameter(torch.zeros(new_shape, device=self.device))
-        super().load_state_dict(dict, **kwargs)
+        load_kwargs = {**kwargs, "strict": False}
+        if not self.config.use_bilateral_grid:
+            dict = {k: v for k, v in dict.items() if not k.startswith("bil_grids.")}
+        super().load_state_dict(dict, **load_kwargs)
 
     def k_nearest_sklearn(self, x: torch.Tensor, k: int):
         """
@@ -847,6 +860,31 @@ class SplatfactoModel(Model):
             return TF.resize(image.permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
         return image
 
+    def _uses_3dgut_render(self) -> bool:
+        return self.config.render_camera_model in ("fisheye", "ftheta")
+
+    def _get_ftheta_coeffs(self):
+        if not hasattr(self, "_ftheta_coeffs_cache"):
+            if self.config.ftheta_coeffs_path is not None:
+                self._ftheta_coeffs_cache = load_ftheta_coeffs_from_json(self.config.ftheta_coeffs_path)
+            else:
+                from street_gaussians_ns.gsplat_compat import default_ftheta_coeffs
+
+                self._ftheta_coeffs_cache = default_ftheta_coeffs()
+        return self._ftheta_coeffs_cache
+
+    def _build_viewmat_from_camera(self, optimized_camera_to_world: torch.Tensor) -> torch.Tensor:
+        R = optimized_camera_to_world[:3, :3]
+        T = optimized_camera_to_world[:3, 3:4]
+        R_edit = torch.diag(torch.tensor([1, -1, -1], device=self.device, dtype=R.dtype))
+        R = R @ R_edit
+        R_inv = R.T
+        T_inv = -R_inv @ T
+        viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
+        viewmat[:3, :3] = R_inv
+        viewmat[:3, 3:4] = T_inv
+        return viewmat
+
     @staticmethod
     def get_empty_outputs(width: int, height: int, background: torch.Tensor) -> Dict[str, Union[torch.Tensor, List]]:
         rgb = background.repeat(height, width, 1)
@@ -891,24 +929,12 @@ class SplatfactoModel(Model):
             crop_ids = None
         camera_downscale = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_downscale)
-        # shift the camera to center of scene looking at center
-        R = optimized_camera_to_world[:3, :3]  # 3 x 3
-        T = optimized_camera_to_world[:3, 3:4]  # 3 x 1
-
-        # flip the z and y axes to align with gsplat conventions
-        R_edit = torch.diag(torch.tensor([1, -1, -1], device=self.device, dtype=R.dtype))
-        R = R @ R_edit
-        # analytic matrix inverse to get world2camera matrix
-        R_inv = R.T
-        T_inv = -R_inv @ T
-        viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
-        viewmat[:3, :3] = R_inv
-        viewmat[:3, 3:4] = T_inv
-        # calculate the FOV of the camera given fx and fy, width and height
+        viewmat = self._build_viewmat_from_camera(optimized_camera_to_world)
         cx = camera.cx.item()
         cy = camera.cy.item()
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
+        use_3dgut = self._uses_3dgut_render()
 
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]
@@ -926,26 +952,28 @@ class SplatfactoModel(Model):
             quats_crop = self.quats
         scales_crop = torch.exp(scales_crop)
         colors_crop = torch.cat((features_dc_crop, features_rest_crop), dim=1)
+        quats_norm = quats_crop / quats_crop.norm(dim=-1, keepdim=True)
 
-        self.xys, self.depths, self.radii, self.conics, _, self.num_tiles_hit, _ = project_gaussians(  # type: ignore
-            means_crop,
-            scales_crop,
-            1,
-            quats_crop / quats_crop.norm(dim=-1, keepdim=True),
-            viewmat.squeeze()[:3, :],
-            camera.fx.item(),
-            camera.fy.item(),
-            cx,
-            cy,
-            H,
-            W,
-            self.config.block_width,
-        )  # type: ignore
+        if not use_3dgut:
+            self.xys, self.depths, self.radii, self.conics, _, self.num_tiles_hit, _ = project_gaussians(  # type: ignore
+                means_crop,
+                scales_crop,
+                1,
+                quats_norm,
+                viewmat.squeeze()[:3, :],
+                camera.fx.item(),
+                camera.fy.item(),
+                cx,
+                cy,
+                H,
+                W,
+                self.config.block_width,
+            )  # type: ignore
 
         if self.config.use_sky_sphere:
             sky_capture = self.env_map(camera, self.training)
 
-        if (self.radii).sum() == 0:
+        if not use_3dgut and (self.radii).sum() == 0:
             out = {
                 "rgb": background.repeat(camera.height.item(), camera.width.item(), 1),
                 "accumulation": torch.zeros(camera.height.item(), camera.width.item(), 1, device=self.device),
@@ -955,20 +983,27 @@ class SplatfactoModel(Model):
                 out["sky"] = sky_capture
             return out
 
-        # Important to allow xys grads to populate properly
-        if self.training:
+        if not use_3dgut and self.training:
             self.xys.retain_grad()
 
         gaussian_attrs = {
             "means": means_crop,
             "colors": colors_crop,
             "opacities": opacities_crop,
-            "xys": self.xys,
-            "depths": self.depths,
-            "radii": self.radii,
-            "conics": self.conics,
-            "num_tiles_hit": self.num_tiles_hit,
+            "quats": quats_norm,
+            "scales": scales_crop,
+            "viewmat": viewmat,
         }
+        if not use_3dgut:
+            gaussian_attrs.update(
+                {
+                    "xys": self.xys,
+                    "depths": self.depths,
+                    "radii": self.radii,
+                    "conics": self.conics,
+                    "num_tiles_hit": self.num_tiles_hit,
+                }
+            )
         if self.config.use_sky_sphere:
             gaussian_attrs['sky_capture'] = sky_capture
 
@@ -1008,12 +1043,7 @@ class SplatfactoModel(Model):
         means = gaussian_attrs['means']
         colors = gaussian_attrs['colors']
         opacities = gaussian_attrs['opacities']
-        xys = gaussian_attrs['xys']
-        depths = gaussian_attrs['depths']
-        radii = gaussian_attrs['radii']
-        conics = gaussian_attrs['conics']
-        num_tiles_hit = gaussian_attrs['num_tiles_hit']
-        W, H = camera.width.item(), camera.height.item()
+        W, H = int(camera.width.item()), int(camera.height.item())
         background = self.back_color.to(self.device)
     
         if self.config.sh_degree > 0:
@@ -1027,66 +1057,111 @@ class SplatfactoModel(Model):
         else:
             rgbs = torch.sigmoid(colors[:, 0, :])
 
-        assert (self.num_tiles_hit > 0).any()  # type: ignore
-        # apply the compensation of screen space blurring to gaussians
         if self.config.rasterize_mode == "antialiased":
-            opacities = torch.sigmoid(opacities) #* comp[:, None]
+            opacities = torch.sigmoid(opacities)
         elif self.config.rasterize_mode == "classic":
             opacities = torch.sigmoid(opacities)
         else:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        if 'rgb' in output_names or 'accumulation' in output_names:
-            rgb, alpha = rasterize_gaussians(  # type: ignore
-                xys,
-                depths,
-                radii,
-                conics,
-                num_tiles_hit,
-                rgbs,
-                opacities,
-                H,
-                W,
-                self.config.block_width,
+        alpha: Optional[torch.Tensor] = None
+
+        if self._uses_3dgut_render():
+            need_depth = "depth" in output_names
+            gs_render_mode: Literal["RGB", "RGB+D"] = "RGB+D" if need_depth else "RGB"
+            ftheta_coeffs = self._get_ftheta_coeffs() if self.config.render_camera_model == "ftheta" else None
+            distortion = camera.distortion_params[0] if camera.distortion_params is not None else None
+            rgb, alpha, depth_im = rasterize_gaussians_3dgut(
+                means=means,
+                quats=gaussian_attrs["quats"],
+                scales=gaussian_attrs["scales"],
+                opacities=opacities,
+                colors=rgbs,
+                viewmat=gaussian_attrs["viewmat"],
+                fx=camera.fx.item(),
+                fy=camera.fy.item(),
+                cx=camera.cx.item(),
+                cy=camera.cy.item(),
+                img_height=H,
+                img_width=W,
+                camera_model=self.config.render_camera_model,  # type: ignore[arg-type]
+                distortion_params=distortion,
+                ftheta_coeffs=ftheta_coeffs,
                 background=background,
-                return_alpha=True,
-            )  # type: ignore
-            if alpha.ndim == 2:
-                alpha = alpha.unsqueeze(-1)
-            rgb = torch.clamp(rgb, max=1.0)  # type: ignore
-
-            if 'sky_capture' in gaussian_attrs:
-                sky_capture = gaussian_attrs['sky_capture']
+                rasterize_mode=self.config.rasterize_mode,
+                render_mode=gs_render_mode,
+                tile_size=self.config.block_width,
+            )
+            rgb = torch.clamp(rgb, max=1.0)
+            if "sky_capture" in gaussian_attrs:
                 rgb = rgb * alpha + sky_capture * (1 - alpha)
-
-            if self.config.use_bilateral_grid and self.training:
-                if camera.metadata is not None and "cam_idx" in camera.metadata:
-                    rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
-                    rgb = rgb.squeeze(0)
-
             if not self.training:
-                rgb = rgb.clamp(0., 1.)
-            if 'rgb' in output_names:
-                outputs['rgb'] = rgb
-            if 'accumulation' in output_names:
-                outputs['accumulation'] = alpha
-        
-        if 'depth' in output_names:
-            depth_im = rasterize_gaussians(
-                xys,
-                depths,
-                radii,
-                conics,
-                num_tiles_hit,
-                depths[:, None].repeat(1, 3),
-                opacities,
-                H,
-                W,
-                self.config.block_width,
-                torch.zeros(3, device=self.device),
-            )[..., 0:1]
-            depth_im = torch.where(alpha > 1e-3, depth_im / alpha, 10)
-            outputs['depth'] = depth_im
+                rgb = rgb.clamp(0.0, 1.0)
+            if "rgb" in output_names:
+                outputs["rgb"] = rgb
+            if "accumulation" in output_names:
+                outputs["accumulation"] = alpha
+            if need_depth and depth_im is not None:
+                depth_im = torch.where(alpha > 1e-3, depth_im / alpha.clamp(min=1e-10), 10)
+                outputs["depth"] = depth_im
+        else:
+            xys = gaussian_attrs['xys']
+            depths = gaussian_attrs['depths']
+            radii = gaussian_attrs['radii']
+            conics = gaussian_attrs['conics']
+            num_tiles_hit = gaussian_attrs['num_tiles_hit']
+            assert (num_tiles_hit > 0).any()
+
+            if 'rgb' in output_names or 'accumulation' in output_names:
+                rgb, alpha = rasterize_gaussians(  # type: ignore
+                    xys,
+                    depths,
+                    radii,
+                    conics,
+                    num_tiles_hit,
+                    rgbs,
+                    opacities,
+                    H,
+                    W,
+                    self.config.block_width,
+                    background=background,
+                    return_alpha=True,
+                )  # type: ignore
+                if alpha.ndim == 2:
+                    alpha = alpha.unsqueeze(-1)
+                rgb = torch.clamp(rgb, max=1.0)  # type: ignore
+
+                if 'sky_capture' in gaussian_attrs:
+                    rgb = rgb * alpha + sky_capture * (1 - alpha)
+
+                if self.config.use_bilateral_grid and self.training:
+                    if camera.metadata is not None and "cam_idx" in camera.metadata:
+                        rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
+                        rgb = rgb.squeeze(0)
+
+                if not self.training:
+                    rgb = rgb.clamp(0., 1.)
+                if 'rgb' in output_names:
+                    outputs['rgb'] = rgb
+                if 'accumulation' in output_names:
+                    outputs['accumulation'] = alpha
+            
+            if 'depth' in output_names:
+                depth_im = rasterize_gaussians(
+                    xys,
+                    depths,
+                    radii,
+                    conics,
+                    num_tiles_hit,
+                    depths[:, None].repeat(1, 3),
+                    opacities,
+                    H,
+                    W,
+                    self.config.block_width,
+                    torch.zeros(3, device=self.device),
+                )[..., 0:1]
+                depth_im = torch.where(alpha > 1e-3, depth_im / alpha, 10)  # type: ignore[union-attr]
+                outputs['depth'] = depth_im
         
         if 'sky_capture' in gaussian_attrs and 'sky' in output_names:
             outputs["sky"] = sky_capture

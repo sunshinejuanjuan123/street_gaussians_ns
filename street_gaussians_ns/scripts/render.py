@@ -34,6 +34,8 @@ from nerfstudio.scripts.render import BaseRender
 
 from street_gaussians_ns.data.sgn_datamanager import FullImageDatamanagerConfig
 from street_gaussians_ns.data.sgn_dataset import Dataset
+from street_gaussians_ns.sgn_splatfacto import SplatfactoModel, SplatfactoModelConfig
+from street_gaussians_ns.sgn_splatfacto_scene_graph import SplatfactoSceneGraphModel
 
 
 @contextmanager
@@ -79,6 +81,15 @@ class DatasetRender(BaseRender):
     """Load sky sphere image"""
     export_sky_sphere_mask: bool = False
     """Export sky sphere sphere mask image, only support splatfacto model"""
+    render_camera_model: Literal["pinhole", "fisheye", "ftheta"] = "pinhole"
+    """Camera model for rendering. fisheye/ftheta use gsplat 3DGUT (with_ut + with_eval3d)."""
+    ftheta_coeffs_path: Optional[Path] = None
+    """JSON path for FThetaCameraDistortionParameters (ftheta mode)."""
+    undistort: bool = True
+    """Whether to undistort images in the dataparser. Set False for raw distorted images."""
+
+    def _uses_3dgut_render(self) -> bool:
+        return self.render_camera_model != "pinhole"
 
     def __post_init__(self):
         if self.output_path is None:
@@ -105,6 +116,15 @@ class DatasetRender(BaseRender):
             if self.downscale_factor is not None:
                 assert hasattr(data_manager_config.dataparser, "downscale_factor")
                 setattr(data_manager_config.dataparser, "downscale_factor", self.downscale_factor)
+            if self._uses_3dgut_render() or not self.undistort:
+                assert hasattr(data_manager_config.dataparser, "undistort")
+                data_manager_config.dataparser.undistort = False
+            if self._uses_3dgut_render():
+                _apply_render_camera_model_config(
+                    config.pipeline.model,
+                    self.render_camera_model,
+                    self.ftheta_coeffs_path,
+                )
             return config
 
         config, pipeline, _, _ = eval_setup(
@@ -115,6 +135,13 @@ class DatasetRender(BaseRender):
         )
         data_manager_config = config.pipeline.datamanager
         assert isinstance(data_manager_config, (VanillaDataManagerConfig, FullImageDatamanagerConfig))
+
+        if self._uses_3dgut_render():
+            _apply_render_camera_model_config(
+                pipeline.model,
+                self.render_camera_model,
+                self.ftheta_coeffs_path,
+            )
 
         for split in self.split.split("+"):
             datamanager: VanillaDataManager
@@ -307,6 +334,31 @@ class DatasetRender(BaseRender):
 
         dataset.cameras = cameras
         dataparser_outputs.cameras = cameras
+
+
+def _apply_render_camera_model_config(
+    model: Any,
+    render_camera_model: Literal["pinhole", "fisheye", "ftheta"],
+    ftheta_coeffs_path: Optional[Path],
+) -> None:
+    """Set 3DGUT render options on splatfacto or scene-graph models."""
+
+    def _set(cfg: SplatfactoModelConfig) -> None:
+        cfg.render_camera_model = render_camera_model
+        cfg.ftheta_coeffs_path = ftheta_coeffs_path
+
+    if isinstance(model, SplatfactoSceneGraphModel):
+        _set(model.config)
+        _set(model.config.background_model)
+        _set(model.config.object_model_template)
+        model.config.render_camera_model = render_camera_model
+        model.config.ftheta_coeffs_path = ftheta_coeffs_path
+        for sub in model.all_models.values():
+            if isinstance(sub, SplatfactoModel):
+                sub.config.render_camera_model = render_camera_model
+                sub.config.ftheta_coeffs_path = ftheta_coeffs_path
+    elif isinstance(model, SplatfactoModel):
+        _set(model.config)
 
 
 Commands = tyro.conf.FlagConversionOff[
