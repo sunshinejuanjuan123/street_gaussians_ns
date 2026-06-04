@@ -7,7 +7,8 @@ dependencies=[
     "imagesize",
     "kornia",
     "plyfile",
-    "nerfstudio"
+    "nerfstudio==1.1.4",
+    "gsplat==1.0.0",
 ]
 
 [tool.setuptools.packages.find]

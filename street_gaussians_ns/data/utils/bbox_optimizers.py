@@ -18,7 +18,7 @@ from nerfstudio.utils import poses as pose_utils
 from nerfstudio.engine.optimizers import OptimizerConfig
 from nerfstudio.engine.schedulers import SchedulerConfig
 from nerfstudio.cameras.camera_utils import quaternion_from_matrix, quaternion_matrix
-from street_gaussians_ns.utils.quaternion import quaternion_multiply
+from pytorch3d.transforms import quaternion_multiply
 
 from street_gaussians_ns.data.utils.dynamic_annotation import InterpolatedAnnotation, Box
 

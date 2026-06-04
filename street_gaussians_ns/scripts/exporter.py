@@ -27,7 +27,7 @@ from nerfstudio.exporter.exporter_utils import collect_camera_poses, generate_po
 from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
 from nerfstudio.fields.sdf_field import SDFField  # noqa
 from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
-from nerfstudio.utils.eval_utils import eval_setup
+from street_gaussians_ns.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.scripts.exporter import Exporter
 

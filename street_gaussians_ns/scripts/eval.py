@@ -15,7 +15,7 @@ import torchvision.utils as vutils
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 
 from nerfstudio.engine.trainer import TrainerConfig
-from nerfstudio.utils.eval_utils import eval_setup
+from street_gaussians_ns.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils import profiler
 

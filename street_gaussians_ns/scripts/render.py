@@ -28,7 +28,7 @@ from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager, Va
 from nerfstudio.data.utils.dataloaders import FixedIndicesEvalDataloader
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.utils import colormaps
-from nerfstudio.utils.eval_utils import eval_setup
+from street_gaussians_ns.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE, ItersPerSecColumn
 from nerfstudio.scripts.render import BaseRender
 

@@ -9,58 +9,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 from gsplat import project_gaussians, rasterize_gaussians, spherical_harmonics
-
-# gsplat API moved across versions; keep this import compatible.
-try:
-    from gsplat.cuda_legacy._torch_impl import quat_to_rotmat  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from gsplat.cuda._torch_impl import quat_to_rotmat  # type: ignore
-    except Exception:  # pragma: no cover
-        try:
-            from gsplat._torch_impl import quat_to_rotmat  # type: ignore
-        except Exception:  # pragma: no cover
-            def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:  # type: ignore
-                """Convert quaternion (x,y,z,w) to rotation matrix.
-
-                This is a fallback for gsplat import path changes.
-                """
-                if quat.shape[-1] != 4:
-                    raise ValueError(f"Expected quat [...,4], got {tuple(quat.shape)}")
-                q = quat / (quat.norm(dim=-1, keepdim=True) + 1e-12)
-                x, y, z, w = q.unbind(dim=-1)
-                xx, yy, zz = x * x, y * y, z * z
-                xy, xz, yz = x * y, x * z, y * z
-                wx, wy, wz = w * x, w * y, w * z
-                m00 = 1 - 2 * (yy + zz)
-                m01 = 2 * (xy - wz)
-                m02 = 2 * (xz + wy)
-                m10 = 2 * (xy + wz)
-                m11 = 1 - 2 * (xx + zz)
-                m12 = 2 * (yz - wx)
-                m20 = 2 * (xz - wy)
-                m21 = 2 * (yz + wx)
-                m22 = 1 - 2 * (xx + yy)
-                return torch.stack(
-                    [
-                        torch.stack([m00, m01, m02], dim=-1),
-                        torch.stack([m10, m11, m12], dim=-1),
-                        torch.stack([m20, m21, m22], dim=-1),
-                    ],
-                    dim=-2,
-                )
-
-try:
-    from gsplat.cuda_legacy._wrapper import num_sh_bases  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from gsplat.cuda._wrapper import num_sh_bases  # type: ignore
-    except Exception:  # pragma: no cover
-        try:
-            from gsplat._wrapper import num_sh_bases  # type: ignore
-        except Exception:  # pragma: no cover
-            def num_sh_bases(degree: int) -> int:  # type: ignore
-                return (int(degree) + 1) ** 2
+from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
+from gsplat.cuda_legacy._wrapper import num_sh_bases
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
 from typing_extensions import Literal
@@ -921,15 +871,6 @@ class SplatfactoModel(Model):
         cy = camera.cy.item()
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
-        fovx = 2 * math.atan(W / (2 * camera.fx))
-        fovy = 2 * math.atan(H / (2 * camera.fy))
-        projmat = projection_matrix(0.001, 1000, fovx, fovy, device=self.device)
-        block_size = self.config.block_width
-        tile_bounds = (
-            int((W + block_size - 1) // block_size),
-            int((H + block_size - 1) // block_size),
-            1,
-        )
 
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]
@@ -948,20 +889,19 @@ class SplatfactoModel(Model):
         scales_crop = torch.exp(scales_crop)
         colors_crop = torch.cat((features_dc_crop, features_rest_crop), dim=1)
 
-        self.xys, self.depths, self.radii, self.conics, self.num_tiles_hit, _ = project_gaussians(  # type: ignore
+        self.xys, self.depths, self.radii, self.conics, _, self.num_tiles_hit, _ = project_gaussians(  # type: ignore
             means_crop,
             scales_crop,
             1,
             quats_crop / quats_crop.norm(dim=-1, keepdim=True),
             viewmat.squeeze()[:3, :],
-            projmat.squeeze() @ viewmat.squeeze(),
             camera.fx.item(),
             camera.fy.item(),
             cx,
             cy,
             H,
             W,
-            tile_bounds,
+            self.config.block_width,
         )  # type: ignore
 
         if self.config.use_sky_sphere:
@@ -1036,7 +976,18 @@ class SplatfactoModel(Model):
         else:
             rgbs = torch.sigmoid(colors[:, 0, :])
 
-        assert (self.num_tiles_hit > 0).any()  # type: ignore
+        if radii.sum() == 0 or not (num_tiles_hit > 0).any():
+            if "rgb" in output_names or "accumulation" in output_names:
+                if "rgb" in output_names:
+                    outputs["rgb"] = background.repeat(H, W, 1)
+                if "accumulation" in output_names:
+                    outputs["accumulation"] = torch.zeros(H, W, 1, device=self.device)
+            if "depth" in output_names:
+                outputs["depth"] = torch.zeros(H, W, 1, device=self.device)
+            if "sky_capture" in gaussian_attrs and "sky" in output_names:
+                outputs["sky"] = gaussian_attrs["sky_capture"]
+            return outputs
+
         # apply the compensation of screen space blurring to gaussians
         if self.config.rasterize_mode == "antialiased":
             opacities = torch.sigmoid(opacities) #* comp[:, None]
@@ -1046,7 +997,7 @@ class SplatfactoModel(Model):
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
         if 'rgb' in output_names or 'accumulation' in output_names:
-            rgb = rasterize_gaussians(  # type: ignore
+            rgb, alpha = rasterize_gaussians(  # type: ignore
                 xys,
                 depths,
                 radii,
@@ -1056,20 +1007,11 @@ class SplatfactoModel(Model):
                 opacities,
                 H,
                 W,
+                self.config.block_width,
                 background=background,
+                return_alpha=True,
             )  # type: ignore
-            alpha = rasterize_gaussians(  # type: ignore
-                xys,
-                depths,
-                radii,
-                conics,
-                num_tiles_hit,
-                torch.ones((opacities.shape[0], 3), device=opacities.device, dtype=opacities.dtype),
-                opacities,
-                H,
-                W,
-                background=torch.zeros(3, device=self.device),
-            )[..., 0:1]  # type: ignore
+            alpha = alpha[..., None]
             rgb = torch.clamp(rgb, max=1.0)  # type: ignore
 
             if 'sky_capture' in gaussian_attrs:
@@ -1100,7 +1042,8 @@ class SplatfactoModel(Model):
                 opacities,
                 H,
                 W,
-                background=torch.zeros(3, device=self.device),
+                self.config.block_width,
+                torch.zeros(3, device=self.device),
             )[..., 0:1]
             depth_im = torch.where(alpha > 1e-3, depth_im / alpha, 10)
             outputs['depth'] = depth_im
