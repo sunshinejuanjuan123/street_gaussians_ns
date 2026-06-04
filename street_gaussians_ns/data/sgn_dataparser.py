@@ -109,6 +109,26 @@ class ColmapDataParserConfig(DataParserConfig):
     """Frame selection for dynamic annotations."""
 
 
+def _resolve_annotation_json(data: Path) -> Path:
+    for candidate in (data / "annotation.json", data / "annotation_v1.json"):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Dynamic annotation file not found under {data}. "
+        "Expected annotation.json or annotation_v1.json."
+    )
+
+
+def _resolve_dynamic_lidar_dir(data: Path) -> Optional[Path]:
+    for candidate in (
+        data / "aggregate_lidar" / "dynamic_objects",
+        data / "aggregate_lidar_v1" / "dynamic_objects",
+    ):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 class ColmapDataParser(DataParser):
     """COLMAP DatasetParser.
     Expects a folder with the following structure:
@@ -465,10 +485,15 @@ class ColmapDataParser(DataParser):
         if self.config.load_dynamic_annotations:
             print("load dynamic annotations")
             transform_matrix_anno = transform_matrix.numpy()
+            anno_json_path = _resolve_annotation_json(self.config.data)
+            lidar_path = _resolve_dynamic_lidar_dir(self.config.data)
+            CONSOLE.log(f"Using annotation file: {anno_json_path}")
+            if lidar_path is not None:
+                CONSOLE.log(f"Using dynamic object lidar dir: {lidar_path}")
 
             metadata.update({"object_annos":InterpolatedAnnotation(
-                anno_json_path=self.config.data / 'annotation.json',
-                lidar_path=self.config.data / 'aggregate_lidar' / 'dynamic_objects',
+                anno_json_path=anno_json_path,
+                lidar_path=lidar_path,
                 transform_matrix=transform_matrix_anno,
                 scale_factor=scale_factor,)})
             # TOOD anno pointcloud

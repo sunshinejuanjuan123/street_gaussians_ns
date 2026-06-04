@@ -6,6 +6,7 @@ import copy
 import math
 
 # from gsplat.sh import spherical_harmonics
+from gsplat import spherical_harmonics
 from pytorch3d.transforms import quaternion_multiply
 from torch.nn import Parameter
 import mediapy as media
@@ -272,15 +273,32 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
             submodel_features_dc = torch.cat(object_features_dc, dim=0)
         submodel_opacities = self.aggregate_submodel_var("opacities", submodel_names)
         submodel_features_rest = self.aggregate_submodel_var("features_rest", submodel_names)
-        submodel_quats = self.aggregate_submodel_var("quats", submodel_names)
-        submodel_scales = self.aggregate_submodel_var("scales", submodel_names)
+        submodel_xys = self.aggregate_submodel_var("xys", submodel_names)
+        submodel_depths = self.aggregate_submodel_var("depths", submodel_names)
+        submodel_radii = self.aggregate_submodel_var("radii", submodel_names)
+        submodel_conics = self.aggregate_submodel_var("conics", submodel_names)
+        submodel_num_tiles_hit = self.aggregate_submodel_var("num_tiles_hit", submodel_names)
+        # render submodel
         colors = torch.cat((submodel_features_dc, submodel_features_rest), dim=1)
+        if self.config.sh_degree > 0:
+            viewdirs = submodel_means.detach() - camera.camera_to_worlds.detach()[..., :3, 3]  # (N, 3)
+            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+            n = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+            if not self.training:
+                n = self.config.sh_degree
+            rgbs = spherical_harmonics(n, viewdirs, colors)
+            rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
+        else:
+            rgbs = torch.sigmoid(colors[:, 0, :])
         gaussian_attrs = {
             "means": submodel_means,
-            "quats": submodel_quats,
-            "scales": submodel_scales,
             "colors": colors,
             "opacities": submodel_opacities,
+            "xys": submodel_xys,
+            "depths": submodel_depths,
+            "radii": submodel_radii,
+            "conics": submodel_conics,
+            "num_tiles_hit": submodel_num_tiles_hit,
         }
         if sky_capture is not None:
             gaussian_attrs["sky_capture"] = sky_capture

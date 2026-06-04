@@ -214,7 +214,7 @@ class InterpolatedAnnotation:
         # anno_json_path = Path(root)/'annotation.json'
         annos = []
         if anno_json_path is not None:
-            assert anno_json_path.exists()
+            assert anno_json_path.exists(), f"Annotation file not found: {anno_json_path}"
             # dynamic obj
             annos = json.load(open(anno_json_path))["frames"]
             annos = sorted(annos, key=lambda x: x['timestamp'])

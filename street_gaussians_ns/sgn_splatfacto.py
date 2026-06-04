@@ -8,10 +8,29 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, Union
 
-try:
-    from gsplat.rendering import rasterization
-except ImportError:
-    rasterization = None  # type: ignore
+from gsplat import spherical_harmonics
+from street_gaussians_ns.gsplat_compat import project_gaussians, rasterize_gaussians
+
+
+def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:
+    """Convert quaternion (wxyz) to rotation matrix."""
+    assert quat.shape[-1] == 4, quat.shape
+    w, x, y, z = torch.unbind(quat, dim=-1)
+    mat = torch.stack(
+        [
+            1 - 2 * (y**2 + z**2),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x**2 + z**2),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x**2 + y**2),
+        ],
+        dim=-1,
+    )
+    return mat.reshape(quat.shape[:-1] + (3, 3))
 
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
@@ -37,46 +56,16 @@ from nerfstudio.model_components.lib_bilagrid import BilateralGrid, slice, total
 
 from street_gaussians_ns.data.utils.data_utils import SemanticType
 
-def num_sh_bases(degree: int) -> int:
-    """Returns the number of spherical harmonic bases for a given degree."""
-    assert degree <= 4, "We don't support degree greater than 4."
-    return (degree + 1) ** 2
-
-
-def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:
-    assert quat.shape[-1] == 4, quat.shape
-    w, x, y, z = torch.unbind(quat, dim=-1)
-    mat = torch.stack(
-        [
-            1 - 2 * (y**2 + z**2),
-            2 * (x * y - w * z),
-            2 * (x * z + w * y),
-            2 * (x * y + w * z),
-            1 - 2 * (x**2 + z**2),
-            2 * (y * z - w * x),
-            2 * (x * z - w * y),
-            2 * (y * z + w * x),
-            1 - 2 * (x**2 + y**2),
-        ],
-        dim=-1,
-    )
-    return mat.reshape(quat.shape[:-1] + (3, 3))
-
-
-def get_viewmat(optimized_camera_to_world: torch.Tensor) -> torch.Tensor:
-    """Convert camera-to-world to gsplat world-to-camera matrix."""
-    if optimized_camera_to_world.dim() == 2:
-        optimized_camera_to_world = optimized_camera_to_world.unsqueeze(0)
-    R = optimized_camera_to_world[:, :3, :3]
-    T = optimized_camera_to_world[:, :3, 3:4]
-    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
-    R_inv = R.transpose(1, 2)
-    T_inv = -torch.bmm(R_inv, T)
-    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
-    viewmat[:, 3, 3] = 1.0
-    viewmat[:, :3, :3] = R_inv
-    viewmat[:, :3, 3:4] = T_inv
-    return viewmat
+def num_sh_bases(degree: int):
+    if degree == 0:
+        return 1
+    if degree == 1:
+        return 4
+    if degree == 2:
+        return 9
+    if degree == 3:
+        return 16
+    return 25
 
 def random_quat_tensor(N):
     """
@@ -347,7 +336,7 @@ class SplatfactoModel(Model):
             features_dc[:, 0, :3] = torch.rand(num_points, 3)
             # self.features_dc = torch.nn.Parameter(features_dc)
             features_rest = torch.zeros((num_points, dim_sh - 1, 3))
-
+        
         self.gauss_params = torch.nn.ParameterDict(
             {
                 "means": means,
@@ -582,16 +571,20 @@ class SplatfactoModel(Model):
 
     def after_train(self, step: int):
         assert step == self.step
-        if not hasattr(self, "_means2d") or self._means2d is None:
+        if not hasattr(self, "xys") or self.xys is None:
             return
         # to save some training time, we no longer need to update those stats post refinement
         if self.step >= self.config.stop_split_at:
             return
         with torch.no_grad():
             # keep track of a moving average of grad norms
-            visible_mask = (self.radii > 0).any(dim=-1)
-            assert self._means2d.grad is not None  # type: ignore
-            grads = self._means2d.grad.detach().squeeze(0).norm(dim=-1)  # type: ignore
+            radii_scalar = self.radii.squeeze()
+            if radii_scalar.dim() > 1:
+                radii_scalar = radii_scalar.max(dim=-1).values
+            visible_mask = radii_scalar > 0
+            assert self.xys.grad is not None  # type: ignore
+            grads = self.xys.grad.detach().norm(dim=-1)  # type: ignore
+            # print(f"grad norm min {grads.min().item()} max {grads.max().item()} mean {grads.mean().item()} size {grads.shape}")
             if self.xys_grad_norm is None:
                 self.xys_grad_norm = grads
                 self.vis_counts = torch.ones_like(self.xys_grad_norm)
@@ -602,8 +595,8 @@ class SplatfactoModel(Model):
 
             # update the max screen size, as a ratio of number of pixels
             if self.max_2Dsize is None:
-                self.max_2Dsize = torch.zeros(self.radii.shape[0], device=self.device, dtype=torch.float32)
-            newradii = self.radii.detach()[visible_mask].amax(dim=-1).float()
+                self.max_2Dsize = torch.zeros(radii_scalar.shape[0], device=radii_scalar.device, dtype=torch.float32)
+            newradii = radii_scalar.detach()[visible_mask]
             self.max_2Dsize[visible_mask] = torch.maximum(
                 self.max_2Dsize[visible_mask],
                 newradii / float(max(self.last_size[0], self.last_size[1])),
@@ -861,20 +854,6 @@ class SplatfactoModel(Model):
         accumulation = background.new_zeros(*rgb.shape[:2], 1)
         return {"rgb": rgb, "depth": depth, "accumulation": accumulation, "background": background}
 
-    def _get_optimized_camera_to_world(self, camera: Cameras) -> torch.Tensor:
-        if self.training:
-            return self.camera_optimizer.apply_to_camera(camera)[0]
-        return camera.camera_to_worlds[0]
-
-    def _update_screen_space_buffers(self, info: Dict) -> None:
-        """Store projected means and radii from rasterization for densification."""
-        means2d = info["means2d"]
-        if self.training and means2d.requires_grad:
-            means2d.retain_grad()
-        self._means2d = means2d
-        self.xys = means2d[0]
-        self.radii = info["radii"][0]
-
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a Ray Bundle and returns a dictionary of outputs.
 
@@ -892,6 +871,12 @@ class SplatfactoModel(Model):
 
         # get the background color
         background = self.back_color.to(self.device)
+        if self.training:
+            assert camera.shape[0] == 1, "Only one camera at a time"
+            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
+            optimized_camera_to_world = optimized_camera_to_world[0, ...]
+        else:
+            optimized_camera_to_world = camera.camera_to_worlds[0, ...]
 
         if self.crop_box is not None and not self.training:
             crop_ids = self.crop_box.within(self.means).squeeze()
@@ -906,7 +891,23 @@ class SplatfactoModel(Model):
             crop_ids = None
         camera_downscale = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_downscale)
-        H, W = int(camera.height.item()), int(camera.width.item())
+        # shift the camera to center of scene looking at center
+        R = optimized_camera_to_world[:3, :3]  # 3 x 3
+        T = optimized_camera_to_world[:3, 3:4]  # 3 x 1
+
+        # flip the z and y axes to align with gsplat conventions
+        R_edit = torch.diag(torch.tensor([1, -1, -1], device=self.device, dtype=R.dtype))
+        R = R @ R_edit
+        # analytic matrix inverse to get world2camera matrix
+        R_inv = R.T
+        T_inv = -R_inv @ T
+        viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
+        viewmat[:3, :3] = R_inv
+        viewmat[:3, 3:4] = T_inv
+        # calculate the FOV of the camera given fx and fy, width and height
+        cx = camera.cx.item()
+        cy = camera.cy.item()
+        W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
 
         if crop_ids is not None:
@@ -923,17 +924,50 @@ class SplatfactoModel(Model):
             features_rest_crop = self.features_rest
             scales_crop = self.scales
             quats_crop = self.quats
+        scales_crop = torch.exp(scales_crop)
         colors_crop = torch.cat((features_dc_crop, features_rest_crop), dim=1)
+
+        self.xys, self.depths, self.radii, self.conics, _, self.num_tiles_hit, _ = project_gaussians(  # type: ignore
+            means_crop,
+            scales_crop,
+            1,
+            quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+            viewmat.squeeze()[:3, :],
+            camera.fx.item(),
+            camera.fy.item(),
+            cx,
+            cy,
+            H,
+            W,
+            self.config.block_width,
+        )  # type: ignore
 
         if self.config.use_sky_sphere:
             sky_capture = self.env_map(camera, self.training)
 
+        if (self.radii).sum() == 0:
+            out = {
+                "rgb": background.repeat(camera.height.item(), camera.width.item(), 1),
+                "accumulation": torch.zeros(camera.height.item(), camera.width.item(), 1, device=self.device),
+                "depth": torch.zeros(camera.height.item(), camera.width.item(), 1, device=self.device),
+            }
+            if self.config.use_sky_sphere:
+                out["sky"] = sky_capture
+            return out
+
+        # Important to allow xys grads to populate properly
+        if self.training:
+            self.xys.retain_grad()
+
         gaussian_attrs = {
             "means": means_crop,
-            "quats": quats_crop,
-            "scales": scales_crop,
             "colors": colors_crop,
             "opacities": opacities_crop,
+            "xys": self.xys,
+            "depths": self.depths,
+            "radii": self.radii,
+            "conics": self.conics,
+            "num_tiles_hit": self.num_tiles_hit,
         }
         if self.config.use_sky_sphere:
             gaussian_attrs['sky_capture'] = sky_capture
@@ -943,8 +977,6 @@ class SplatfactoModel(Model):
             output_names.append('sky')
 
         out = self.render_gaussian_attrs(camera, gaussian_attrs, output_names)
-        if hasattr(self, "_last_raster_info") and self._last_raster_info is not None:
-            self._update_screen_space_buffers(self._last_raster_info)
 
         # rescale the camera back to original dimensions
         camera.rescale_output_resolution(camera_downscale)
@@ -967,123 +999,96 @@ class SplatfactoModel(Model):
         )
         return out["rgb"]
 
-    def render_gaussian_attrs(
-        self, camera: Cameras, gaussian_attrs: Dict[str, Union[torch.Tensor, List]], output_names: List[str] = []
-    ) -> Dict[str, Union[torch.Tensor, List]]:
-        if rasterization is None:
-            raise ImportError("Please install gsplat>=1.0.0")
+    def render_gaussian_attrs(self, camera: Cameras, gaussian_attrs: Dict[str, Union[torch.Tensor, List]], output_names: List[str]=[]) -> Dict[str, Union[torch.Tensor, List]]:
+        
+        if self.config.use_sky_sphere and 'sky_capture' in gaussian_attrs:
+            sky_capture = gaussian_attrs['sky_capture']
 
-        sky_capture = gaussian_attrs.get("sky_capture") if self.config.use_sky_sphere else None
-        outputs: Dict[str, Union[torch.Tensor, List]] = {}
-
-        means = gaussian_attrs["means"]
-        quats = gaussian_attrs["quats"]
-        scales = gaussian_attrs["scales"]
-        colors = gaussian_attrs["colors"]
-        opacities = gaussian_attrs["opacities"]
-
-        if means.shape[0] == 0:
-            if getattr(self, "last_size", None) is not None:
-                H, W = self.last_size
-            else:
-                W, H = int(camera.width.item()), int(camera.height.item())
-            background = self.back_color.to(self.device)
-            if "rgb" in output_names:
-                outputs["rgb"] = background.repeat(H, W, 1)
-            if "accumulation" in output_names:
-                outputs["accumulation"] = torch.zeros(H, W, 1, device=self.device)
-            if "depth" in output_names:
-                outputs["depth"] = torch.zeros(H, W, 1, device=self.device)
-            if sky_capture is not None and "sky" in output_names:
-                outputs["sky"] = sky_capture
-            return outputs
-
-        optimized_camera_to_world = self._get_optimized_camera_to_world(camera)
-        viewmat = get_viewmat(optimized_camera_to_world)
-        K = camera.get_intrinsics_matrices().cuda()
-        if getattr(self, "last_size", None) is not None:
-            H, W = self.last_size
-        else:
-            W, H = int(camera.width.item()), int(camera.height.item())
+        outputs = {}
+        means = gaussian_attrs['means']
+        colors = gaussian_attrs['colors']
+        opacities = gaussian_attrs['opacities']
+        xys = gaussian_attrs['xys']
+        depths = gaussian_attrs['depths']
+        radii = gaussian_attrs['radii']
+        conics = gaussian_attrs['conics']
+        num_tiles_hit = gaussian_attrs['num_tiles_hit']
+        W, H = camera.width.item(), camera.height.item()
         background = self.back_color.to(self.device)
+    
+        if self.config.sh_degree > 0:
+            viewdirs = means.detach() - camera.camera_to_worlds.detach()[..., :3, 3]  # (N, 3)
+            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+            n = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+            if not self.training:
+                n = self.config.sh_degree
+            rgbs = spherical_harmonics(n, viewdirs, colors)
+            rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
+        else:
+            rgbs = torch.sigmoid(colors[:, 0, :])
 
-        if self.config.rasterize_mode not in ["antialiased", "classic"]:
+        assert (self.num_tiles_hit > 0).any()  # type: ignore
+        # apply the compensation of screen space blurring to gaussians
+        if self.config.rasterize_mode == "antialiased":
+            opacities = torch.sigmoid(opacities) #* comp[:, None]
+        elif self.config.rasterize_mode == "classic":
+            opacities = torch.sigmoid(opacities)
+        else:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        need_depth = "depth" in output_names
-        need_rgb = "rgb" in output_names or "accumulation" in output_names
-        if need_rgb and need_depth:
-            render_mode = "RGB+ED"
-        elif need_depth:
-            render_mode = "ED"
-        else:
-            render_mode = "RGB"
+        if 'rgb' in output_names or 'accumulation' in output_names:
+            rgb, alpha = rasterize_gaussians(  # type: ignore
+                xys,
+                depths,
+                radii,
+                conics,
+                num_tiles_hit,
+                rgbs,
+                opacities,
+                H,
+                W,
+                self.config.block_width,
+                background=background,
+                return_alpha=True,
+            )  # type: ignore
+            if alpha.ndim == 2:
+                alpha = alpha.unsqueeze(-1)
+            rgb = torch.clamp(rgb, max=1.0)  # type: ignore
 
-        if self.config.sh_degree > 0:
-            sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
-            if not self.training:
-                sh_degree_to_use = self.config.sh_degree
-            colors_for_rast = colors
-        else:
-            sh_degree_to_use = None
-            colors_for_rast = torch.sigmoid(colors[:, 0, :])
-
-        render, alpha, info = rasterization(
-            means=means,
-            quats=quats,
-            scales=torch.exp(scales),
-            opacities=torch.sigmoid(opacities).squeeze(-1),
-            colors=colors_for_rast,
-            viewmats=viewmat,
-            Ks=K,
-            width=W,
-            height=H,
-            tile_size=self.config.block_width,
-            packed=False,
-            near_plane=0.01,
-            far_plane=1e10,
-            render_mode=render_mode,
-            sh_degree=sh_degree_to_use,
-            backgrounds=background.unsqueeze(0),
-            rasterize_mode=self.config.rasterize_mode,
-            absgrad=True,
-        )
-        self._last_raster_info = info
-        alpha = alpha.squeeze(0)
-        if alpha.ndim == 2:
-            alpha = alpha[..., None]
-
-        if need_rgb:
-            rgb = render.squeeze(0)[..., :3] + (1 - alpha) * background
-            rgb = torch.clamp(rgb, max=1.0)
-
-            if sky_capture is not None:
-                if sky_capture.shape[0] != H or sky_capture.shape[1] != W:
-                    sky_capture = F.interpolate(
-                        sky_capture.permute(2, 0, 1)[None],
-                        size=(H, W),
-                        mode="bilinear",
-                        align_corners=False,
-                    )[0].permute(1, 2, 0)
+            if 'sky_capture' in gaussian_attrs:
+                sky_capture = gaussian_attrs['sky_capture']
                 rgb = rgb * alpha + sky_capture * (1 - alpha)
 
             if self.config.use_bilateral_grid and self.training:
                 if camera.metadata is not None and "cam_idx" in camera.metadata:
                     rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
+                    rgb = rgb.squeeze(0)
 
             if not self.training:
-                rgb = rgb.clamp(0.0, 1.0)
-            if "rgb" in output_names:
-                outputs["rgb"] = rgb
-            if "accumulation" in output_names:
-                outputs["accumulation"] = alpha
-
-        if need_depth:
-            depth_im = render.squeeze(0)[..., 3:4]
-            depth_im = torch.where(alpha > 1e-3, depth_im, depth_im.detach().max())
-            outputs["depth"] = depth_im
-
-        if sky_capture is not None and "sky" in output_names:
+                rgb = rgb.clamp(0., 1.)
+            if 'rgb' in output_names:
+                outputs['rgb'] = rgb
+            if 'accumulation' in output_names:
+                outputs['accumulation'] = alpha
+        
+        if 'depth' in output_names:
+            depth_im = rasterize_gaussians(
+                xys,
+                depths,
+                radii,
+                conics,
+                num_tiles_hit,
+                depths[:, None].repeat(1, 3),
+                opacities,
+                H,
+                W,
+                self.config.block_width,
+                torch.zeros(3, device=self.device),
+            )[..., 0:1]
+            depth_im = torch.where(alpha > 1e-3, depth_im / alpha, 10)
+            outputs['depth'] = depth_im
+        
+        if 'sky_capture' in gaussian_attrs and 'sky' in output_names:
             outputs["sky"] = sky_capture
 
         return outputs
@@ -1113,8 +1118,6 @@ class SplatfactoModel(Model):
             gt_img = TF.resize(batch["image"].permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
         else:
             gt_img = batch["image"]
-        if gt_img.dtype == torch.uint8:
-            gt_img = gt_img.float() / 255.0
         metrics_dict = {}
         gt_rgb = gt_img.to(self.device)
         predicted_rgb = outputs["rgb"]
@@ -1166,11 +1169,10 @@ class SplatfactoModel(Model):
             if "semantic" in batch:
                 gt_semantic = batch["semantic"]
 
-        if gt_img.dtype == torch.uint8:
-            gt_img = gt_img.float() / 255.0
-
         # RGB loss
         rgb = outputs["rgb"]
+        if gt_img.dtype == torch.uint8:
+            gt_img = gt_img.float() / 255.0
 
         # apply ego car mask
         if mask is not None:
