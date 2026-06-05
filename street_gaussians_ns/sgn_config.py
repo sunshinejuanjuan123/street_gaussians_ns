@@ -5,7 +5,7 @@ from pathlib import Path
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.configs.base_config import ViewerConfig
-from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
+from street_gaussians_ns.sgn_pipeline import SgnPipelineConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.trainer import TrainerConfig
@@ -29,17 +29,30 @@ except ValueError:
 
 print(f"3DGS: STREET_GAUSSIANS_MAX_ITERATIONS={STREET_GAUSSIANS_MAX_ITERATIONS}")
 
+# 少量迭代时让 eval 在训练过程中实际触发（step 范围是 [0, max_num_iterations)）
+if STREET_GAUSSIANS_MAX_ITERATIONS <= 100:
+    _eval_every = max(2, STREET_GAUSSIANS_MAX_ITERATIONS // 3)
+    _steps_per_eval_image = _eval_every
+    _steps_per_eval_batch = _eval_every
+    _steps_per_save = STREET_GAUSSIANS_MAX_ITERATIONS
+    _steps_per_eval_all_images = max(_eval_every, STREET_GAUSSIANS_MAX_ITERATIONS - 1)
+else:
+    _steps_per_eval_image = 500
+    _steps_per_eval_batch = 500
+    _steps_per_save = 2000
+    _steps_per_eval_all_images = 70000
+
 street_gaussians_ns_method = MethodSpecification(
     config=TrainerConfig(
         method_name="street-gaussians-ns",
-        steps_per_eval_image=500,
-        steps_per_eval_batch=500,
-        steps_per_save=2000,
-        steps_per_eval_all_images=70000,
-        max_num_iterations=70000,
+        steps_per_eval_image=_steps_per_eval_image,
+        steps_per_eval_batch=_steps_per_eval_batch,
+        steps_per_save=_steps_per_save,
+        steps_per_eval_all_images=_steps_per_eval_all_images,
+        max_num_iterations=STREET_GAUSSIANS_MAX_ITERATIONS,
         mixed_precision=False,
         gradient_accumulation_steps={"camera_opt": 100, 'semantic': 10},
-        pipeline=VanillaPipelineConfig(
+        pipeline=SgnPipelineConfig(
             datamanager=FullImageDatamanagerConfig(
                 dataparser=ColmapDataParserConfig(
                     load_3D_points=True,

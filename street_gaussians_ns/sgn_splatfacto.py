@@ -584,7 +584,9 @@ class SplatfactoModel(Model):
 
     def after_train(self, step: int):
         assert step == self.step
-        if not hasattr(self, "xys") or self.xys is None:
+        if not hasattr(self, "xys") or self.xys is None or self.xys.grad is None:
+            return
+        if self.radii is None:
             return
         # to save some training time, we no longer need to update those stats post refinement
         if self.step >= self.config.stop_split_at:
@@ -595,20 +597,26 @@ class SplatfactoModel(Model):
             if radii_scalar.dim() > 1:
                 radii_scalar = radii_scalar.max(dim=-1).values
             visible_mask = radii_scalar > 0
-            assert self.xys.grad is not None  # type: ignore
             grads = self.xys.grad.detach().norm(dim=-1)  # type: ignore
-            # print(f"grad norm min {grads.min().item()} max {grads.max().item()} mean {grads.mean().item()} size {grads.shape}")
-            if self.xys_grad_norm is None:
+            num_gaussians = grads.shape[0]
+            stats_stale = (
+                self.xys_grad_norm is None
+                or self.vis_counts is None
+                or self.xys_grad_norm.shape[0] != num_gaussians
+                or self.vis_counts.shape[0] != num_gaussians
+                or radii_scalar.shape[0] != num_gaussians
+            )
+            if stats_stale:
                 self.xys_grad_norm = grads
-                self.vis_counts = torch.ones_like(self.xys_grad_norm)
+                self.vis_counts = torch.ones_like(grads)
+                self.max_2Dsize = None
             else:
-                assert self.vis_counts is not None
                 self.vis_counts[visible_mask] = self.vis_counts[visible_mask] + 1
                 self.xys_grad_norm[visible_mask] = grads[visible_mask] + self.xys_grad_norm[visible_mask]
 
             # update the max screen size, as a ratio of number of pixels
-            if self.max_2Dsize is None:
-                self.max_2Dsize = torch.zeros(radii_scalar.shape[0], device=radii_scalar.device, dtype=torch.float32)
+            if self.max_2Dsize is None or self.max_2Dsize.shape[0] != num_gaussians:
+                self.max_2Dsize = torch.zeros(num_gaussians, device=radii_scalar.device, dtype=torch.float32)
             newradii = radii_scalar.detach()[visible_mask]
             self.max_2Dsize[visible_mask] = torch.maximum(
                 self.max_2Dsize[visible_mask],
@@ -1120,58 +1128,64 @@ class SplatfactoModel(Model):
             radii = gaussian_attrs['radii']
             conics = gaussian_attrs['conics']
             num_tiles_hit = gaussian_attrs['num_tiles_hit']
-            assert (num_tiles_hit > 0).any()
-
-            if 'rgb' in output_names or 'accumulation' in output_names:
-                rgb, alpha = rasterize_gaussians(  # type: ignore
-                    xys,
-                    depths,
-                    radii,
-                    conics,
-                    num_tiles_hit,
-                    rgbs,
-                    opacities,
-                    H,
-                    W,
-                    self.config.block_width,
-                    background=background,
-                    return_alpha=True,
-                )  # type: ignore
-                if alpha.ndim == 2:
-                    alpha = alpha.unsqueeze(-1)
-                rgb = torch.clamp(rgb, max=1.0)  # type: ignore
-
-                if 'sky_capture' in gaussian_attrs:
-                    rgb = rgb * alpha + sky_capture * (1 - alpha)
-
-                if self.config.use_bilateral_grid and self.training:
-                    if camera.metadata is not None and "cam_idx" in camera.metadata:
-                        rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
-                        rgb = rgb.squeeze(0)
-
-                if not self.training:
-                    rgb = rgb.clamp(0., 1.)
+            if not (num_tiles_hit > 0).any():
                 if 'rgb' in output_names:
-                    outputs['rgb'] = rgb
+                    outputs['rgb'] = background.repeat(H, W, 1)
                 if 'accumulation' in output_names:
-                    outputs['accumulation'] = alpha
-            
-            if 'depth' in output_names:
-                depth_im = rasterize_gaussians(
-                    xys,
-                    depths,
-                    radii,
-                    conics,
-                    num_tiles_hit,
-                    depths[:, None].repeat(1, 3),
-                    opacities,
-                    H,
-                    W,
-                    self.config.block_width,
-                    torch.zeros(3, device=self.device),
-                )[..., 0:1]
-                depth_im = torch.where(alpha > 1e-3, depth_im / alpha, 10)  # type: ignore[union-attr]
-                outputs['depth'] = depth_im
+                    outputs['accumulation'] = torch.zeros(H, W, 1, device=self.device)
+                if 'depth' in output_names:
+                    outputs['depth'] = torch.zeros(H, W, 1, device=self.device)
+            else:
+                if 'rgb' in output_names or 'accumulation' in output_names:
+                    rgb, alpha = rasterize_gaussians(  # type: ignore
+                        xys,
+                        depths,
+                        radii,
+                        conics,
+                        num_tiles_hit,
+                        rgbs,
+                        opacities,
+                        H,
+                        W,
+                        self.config.block_width,
+                        background=background,
+                        return_alpha=True,
+                    )  # type: ignore
+                    if alpha.ndim == 2:
+                        alpha = alpha.unsqueeze(-1)
+                    rgb = torch.clamp(rgb, max=1.0)  # type: ignore
+
+                    if 'sky_capture' in gaussian_attrs:
+                        rgb = rgb * alpha + sky_capture * (1 - alpha)
+
+                    if self.config.use_bilateral_grid and self.training:
+                        if camera.metadata is not None and "cam_idx" in camera.metadata:
+                            rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
+                            rgb = rgb.squeeze(0)
+
+                    if not self.training:
+                        rgb = rgb.clamp(0., 1.)
+                    if 'rgb' in output_names:
+                        outputs['rgb'] = rgb
+                    if 'accumulation' in output_names:
+                        outputs['accumulation'] = alpha
+
+                if 'depth' in output_names:
+                    depth_im = rasterize_gaussians(
+                        xys,
+                        depths,
+                        radii,
+                        conics,
+                        num_tiles_hit,
+                        depths[:, None].repeat(1, 3),
+                        opacities,
+                        H,
+                        W,
+                        self.config.block_width,
+                        torch.zeros(3, device=self.device),
+                    )[..., 0:1]
+                    depth_im = torch.where(alpha > 1e-3, depth_im / alpha, 10)  # type: ignore[union-attr]
+                    outputs['depth'] = depth_im
         
         if 'sky_capture' in gaussian_attrs and 'sky' in output_names:
             outputs["sky"] = sky_capture
@@ -1212,7 +1226,8 @@ class SplatfactoModel(Model):
         metrics_dict["scale_mean"] = torch.exp(self.scales).mean()
         metrics_dict["log_scale_mean"] = self.scales.mean()
         metrics_dict["sigmoid_opacity"] = torch.sigmoid(self.opacities).mean()
-        metrics_dict["self.radii"] = self.radii.float().mean()
+        if self.radii is not None:
+            metrics_dict["self.radii"] = self.radii.float().mean()
 
 
         return metrics_dict

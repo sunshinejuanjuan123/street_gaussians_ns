@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Type, Union
 import copy
 import math
+import os
+from pathlib import Path
 
 # from gsplat.sh import spherical_harmonics
 from gsplat import spherical_harmonics
@@ -130,12 +132,33 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
         self.camera_optimizer.get_param_groups(groups)
         return groups
 
+    def _setup_eval_image_dir(self, step: int, trainer=None, pipeline=None):
+        if step > 0 or os.environ.get("SAVE_EVAL_IMAGES", "").strip() != "1":
+            return
+        if trainer is None or pipeline is None:
+            return
+        eval_dir = Path(trainer.base_dir) / "eval_images"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        pipeline._eval_image_output_root = eval_dir
+
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
         cbs = []
         cbs.append(TrainingCallback(
             [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb))
+        if os.environ.get("SAVE_EVAL_IMAGES", "").strip() == "1":
+            cbs.append(
+                TrainingCallback(
+                    [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                    self._setup_eval_image_dir,
+                    iters=(0,),
+                    kwargs={
+                        "trainer": training_callback_attributes.trainer,
+                        "pipeline": training_callback_attributes.pipeline,
+                    },
+                )
+            )
         # for scene graph model, no longer need to call `after_train`` and `refinement_after` of itself
         for model in self.all_models.values():
             cbs += model.get_training_callbacks(training_callback_attributes)

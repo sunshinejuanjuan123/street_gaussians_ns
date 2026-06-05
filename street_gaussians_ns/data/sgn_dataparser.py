@@ -107,8 +107,8 @@ class ColmapDataParserConfig(DataParserConfig):
     """The specified data will be forcely saved or updated after undistorting."""
     load_dynamic_annotations: bool = False
     """Whether to load dynamic annotations."""
-    frame_select= None
-    """Frame selection for dynamic annotations."""
+    frame_select: Optional[Tuple[int, int]] = None
+    """Frame range [start, end) per selected camera. Requires filter_camera_id."""
 
 
 def _resolve_annotation_json(data: Path) -> Path:
