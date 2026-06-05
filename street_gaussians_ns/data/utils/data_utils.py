@@ -95,8 +95,11 @@ def get_depth_image_from_path(
         image = np.load(filepath) * scale_factor
         image = cv2.resize(image, (width, height), interpolation=interpolation)
     elif filepath.suffix == ".npz":
-        # depth for omnidata
-        image = np.load(filepath)['arr_0'] #* scale_factor
+        data = np.load(filepath)
+        if "depth" in data:
+            image = data["depth"].astype(np.float64)
+        else:
+            image = data["arr_0"].astype(np.float64)
         image = cv2.resize(image, (width, height), interpolation=interpolation)
     elif depth_type == "2x8bit" or filepath.suffix == ".png":
         depth_img = cv2.imread(str(filepath.absolute()))
@@ -108,4 +111,25 @@ def get_depth_image_from_path(
         image = image.astype(np.float64) * scale_factor
         image = cv2.resize(image, (width, height), interpolation=interpolation)
     return torch.from_numpy(image).unsqueeze(-1)
+
+
+def get_depth_valid_from_path(
+    filepath: Path,
+    height: int,
+    width: int,
+    scale_factor: float = 1,
+    interpolation: int = cv2.INTER_NEAREST,
+) -> torch.Tensor:
+    """Load depth validity mask from npz (key: valid) or infer from depth > 0."""
+    if filepath.suffix == ".npz":
+        data = np.load(filepath)
+        if "valid" in data:
+            valid = data["valid"].astype(np.float32)
+        else:
+            depth_key = "depth" if "depth" in data else "arr_0"
+            valid = (data[depth_key] > 0).astype(np.float32)
+        valid = cv2.resize(valid, (width, height), interpolation=interpolation)
+        return torch.from_numpy(valid).unsqueeze(-1).bool()
+    depth = get_depth_image_from_path(filepath, height, width, scale_factor, interpolation)
+    return depth > 0
 

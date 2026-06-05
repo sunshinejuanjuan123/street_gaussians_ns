@@ -60,6 +60,7 @@ street_gaussians_ns_method = MethodSpecification(
                     undistort=True,
                     colmap_path=Path("colmap/sparse/0"),
                     segments_path=Path("segs"),
+                    depths_path=Path("depths"),
                     load_dynamic_annotations=True,
                 ),
             ),
@@ -78,6 +79,9 @@ street_gaussians_ns_method = MethodSpecification(
                     reset_alpha_every=30,
                     stop_split_at=50000,
                     fourier_features_dim=1,
+                    depth_loss_mult=0.05,
+                    depth_loss_start_step=500,
+                    output_depth_during_training=True,
                 ),
                 object_model_template=SplatfactoModelConfig(
                     cull_alpha_thresh=0.005,

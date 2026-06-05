@@ -1,7 +1,25 @@
 {
     "reference_poly": "ANGLE_TO_PIXELDIST",
-    "pixeldist_to_angle_poly": [0.0, 8.43e-3, 2.32e-6, -5.05e-8, 6.14e-10, -1.74e-12],
-    "angle_to_pixeldist_poly": [0.0, 118.43, -2.56, 6.32, -10.42, 3.67],
-    "max_angle": 1000,
-    "linear_cde": [0.9997, 1.87e-5, 1.77e-5]
+    "pixeldist_to_angle_poly": [
+        0.0,
+        0.125,
+        -1.8e-5,
+        3.2e-8,
+        -4.1e-11,
+        2.2e-14
+    ],
+    "angle_to_pixeldist_poly": [
+        0.0,
+        7.85,
+        -0.0012,
+        3.8e-6,
+        -8.2e-9,
+        4.1e-12
+    ],
+    "max_angle": 97500,
+    "linear_cde": [
+        0.9999,
+        2.1e-5,
+        2.3e-5
+    ]
 }

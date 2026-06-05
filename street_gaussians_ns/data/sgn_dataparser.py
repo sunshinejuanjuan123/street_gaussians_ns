@@ -643,6 +643,9 @@ class ColmapDataParser(DataParser):
         for key, path, filename in contents:
             if filename is None:
                 continue
+            # Depth maps (.npz) are undistorted at load time in FullImageDatamanager.
+            if key == "depth":
+                continue
             out = self._get_fname(self.config.data / path, filename, undistort=effective_undistort)
             if "all" not in self.config.force_save_undistort_data and key not in self.config.force_save_undistort_data and out.exists():
                 continue
@@ -790,6 +793,8 @@ class ColmapDataParser(DataParser):
         )
 
         for channel, filelist in filenames.items():
+            if channel == "depth":
+                continue
             assert self.channel_path[channel] is not None
             filenames[channel] = [
                 self._get_fname(

@@ -260,8 +260,12 @@ class SplatfactoModelConfig(ModelConfig):
     """threshold of ratio of gaussian max to min scale before applying regularization
     loss from the PhysGaussian paper
     """
-    output_depth_during_training: bool = False
+    output_depth_during_training: bool = True
     """If True, output depth during training. Otherwise, only output depth during evaluation."""
+    depth_loss_mult: float = 0.05
+    """Weight for LiDAR depth supervision loss."""
+    depth_loss_start_step: int = 500
+    """Start applying depth loss after this training step."""
     rasterize_mode: Literal["classic", "antialiased"] = "classic"
     """
     Classic mode of rendering will use the EWA volume splatting with a [0.3, 0.3] screen space blurring kernel. This
@@ -1204,6 +1208,45 @@ class SplatfactoModel(Model):
         return gt_img.to(self.device)
     
 
+    def _get_depth_batch_tensors(self, batch, downscale_factor: int):
+        gt_depth = batch["depth"].to(self.device)
+        if gt_depth.dim() == 2:
+            gt_depth = gt_depth.unsqueeze(-1)
+        depth_valid = batch.get("depth_valid")
+        if depth_valid is None:
+            depth_valid = gt_depth > 0
+        else:
+            depth_valid = depth_valid.to(self.device)
+            if depth_valid.dim() == 2:
+                depth_valid = depth_valid.unsqueeze(-1)
+        if downscale_factor > 1:
+            newsize = (
+                int(math.ceil(gt_depth.shape[0] / downscale_factor)),
+                int(math.ceil(gt_depth.shape[1] / downscale_factor)),
+            )
+            gt_depth = TF.resize(
+                gt_depth.permute(2, 0, 1),
+                newsize,
+                antialias=None,
+                interpolation=TF.InterpolationMode.NEAREST,
+            ).permute(1, 2, 0)
+            depth_valid = TF.resize(
+                depth_valid.permute(2, 0, 1).float(),
+                newsize,
+                antialias=None,
+                interpolation=TF.InterpolationMode.NEAREST,
+            ).permute(1, 2, 0).bool()
+        return gt_depth, depth_valid
+
+    def _compute_depth_error(self, predicted_depth: torch.Tensor, gt_depth: torch.Tensor, depth_valid: torch.Tensor):
+        if predicted_depth.dim() == 2:
+            predicted_depth = predicted_depth.unsqueeze(-1)
+        valid_count = depth_valid.sum().clamp(min=1)
+        depth_diff = torch.abs(predicted_depth - gt_depth) * depth_valid.float()
+        depth_l1 = depth_diff.sum() / valid_count
+        depth_rmse = torch.sqrt((depth_diff.pow(2)).sum() / valid_count)
+        return depth_l1, depth_rmse
+
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
 
@@ -1229,6 +1272,12 @@ class SplatfactoModel(Model):
         if self.radii is not None:
             metrics_dict["self.radii"] = self.radii.float().mean()
 
+        if "depth" in batch and "depth" in outputs:
+            gt_depth, depth_valid = self._get_depth_batch_tensors(batch, d)
+            depth_l1, depth_rmse = self._compute_depth_error(outputs["depth"], gt_depth, depth_valid)
+            metrics_dict["depth_l1"] = depth_l1
+            metrics_dict["depth_rmse"] = depth_rmse
+            metrics_dict["depth_valid_ratio"] = depth_valid.float().mean()
 
         return metrics_dict
 
@@ -1329,6 +1378,17 @@ class SplatfactoModel(Model):
 
         if self.training and self.config.use_bilateral_grid:
             losses["tv_loss"] = 10*total_variation_loss(self.bil_grids.grids)
+
+        if (
+            self.training
+            and self.config.depth_loss_mult > 0
+            and self.step >= self.config.depth_loss_start_step
+            and "depth" in batch
+            and "depth" in outputs
+        ):
+            gt_depth, depth_valid = self._get_depth_batch_tensors(batch, d)
+            depth_l1, _ = self._compute_depth_error(outputs["depth"], gt_depth, depth_valid)
+            losses["depth_loss"] = self.config.depth_loss_mult * depth_l1
         
         if self.training:
             self.camera_optimizer.get_loss_dict(losses)
@@ -1405,8 +1465,14 @@ class SplatfactoModel(Model):
                 depth_img = depth_img.unsqueeze(-1)
             if predicted_depth.dim() == 2:
                 predicted_depth = predicted_depth.unsqueeze(-1)
-            # eval metric
-            # metrics_dict.update(self.depth_result(predicted_depth,depth_img))
+            depth_valid = batch.get("depth_valid")
+            if depth_valid is not None:
+                depth_valid = depth_valid.to(self.device)
+                if depth_valid.dim() == 2:
+                    depth_valid = depth_valid.unsqueeze(-1)
+                depth_l1, depth_rmse = self._compute_depth_error(predicted_depth, depth_img, depth_valid)
+                metrics_dict["depth_l1"] = float(depth_l1.item())
+                metrics_dict["depth_rmse"] = float(depth_rmse.item())
             # vis
             predicted_depth = colormaps.apply_depth_colormap(
                 predicted_depth,

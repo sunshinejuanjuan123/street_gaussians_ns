@@ -272,6 +272,10 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
                 data[i]["mask"] = data[i]["mask"].to(self.device)
             if "semantic" in data[i]:
                 data[i]["semantic"] = data[i]["semantic"].to(self.device)
+            if "depth" in data[i]:
+                data[i]["depth"] = data[i]["depth"].to(self.device)
+            if "depth_valid" in data[i]:
+                data[i]["depth_valid"] = data[i]["depth_valid"].to(self.device)
             cameras.append(_cameras[i : i + 1])
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         return list(zip(cameras, data))
@@ -302,6 +306,10 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             data["mask"] = data["mask"].to(self.device)
         if "semantic" in data:
             data["semantic"] = data["semantic"].to(self.device)
+        if "depth" in data:
+            data["depth"] = data["depth"].to(self.device)
+        if "depth_valid" in data:
+            data["depth_valid"] = data["depth_valid"].to(self.device)
         assert len(self.train_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.train_dataset.cameras[image_idx : image_idx + 1].to(self.device)
         if camera.metadata is None:
@@ -323,6 +331,10 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             data["mask"] = data["mask"].to(self.device)
         if "semantic" in data:
             data["semantic"] = data["semantic"].to(self.device)
+        if "depth" in data:
+            data["depth"] = data["depth"].to(self.device)
+        if "depth_valid" in data:
+            data["depth_valid"] = data["depth_valid"].to(self.device)
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
         return camera, data
@@ -343,6 +355,10 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             data["mask"] = data["mask"].to(self.device)
         if "semantic" in data:
             data["semantic"] = data["semantic"].to(self.device)
+        if "depth" in data:
+            data["depth"] = data["depth"].to(self.device)
+        if "depth_valid" in data:
+            data["depth_valid"] = data["depth_valid"].to(self.device)
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
         return camera, data
@@ -384,6 +400,24 @@ def _undistort_image(
         image = image[y : y + h, x : x + w]
         if "depth_image" in data:
             data["depth_image"] = data["depth_image"][y : y + h, x : x + w]
+        if "depth" in data:
+            depth = data["depth"]
+            if isinstance(depth, torch.Tensor):
+                depth = depth.numpy()
+            if depth.ndim == 3:
+                depth = depth[:, :, 0]
+            if np.any(distortion_params):
+                depth = cv2.undistort(depth.astype(np.float32), K, distortion_params, None, newK)
+            data["depth"] = torch.from_numpy(depth[y : y + h, x : x + w]).unsqueeze(-1)
+        if "depth_valid" in data:
+            depth_valid = data["depth_valid"]
+            if isinstance(depth_valid, torch.Tensor):
+                depth_valid = depth_valid.numpy().astype(np.uint8)
+            if depth_valid.ndim == 3:
+                depth_valid = depth_valid[:, :, 0]
+            if np.any(distortion_params):
+                depth_valid = cv2.undistort(depth_valid.astype(np.float32), K, distortion_params, None, newK)
+            data["depth_valid"] = torch.from_numpy(depth_valid[y : y + h, x : x + w] > 0).unsqueeze(-1).bool()
         if "mask" in data:
             mask = data["mask"].numpy()
             mask = mask.astype(np.uint8) * 255
@@ -411,6 +445,22 @@ def _undistort_image(
         )
         # and then remap:
         image = cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR)
+        if "depth" in data:
+            depth = data["depth"]
+            if isinstance(depth, torch.Tensor):
+                depth = depth.numpy()
+            if depth.ndim == 3:
+                depth = depth[:, :, 0]
+            depth = cv2.remap(depth.astype(np.float32), map1, map2, interpolation=cv2.INTER_NEAREST)
+            data["depth"] = torch.from_numpy(depth).unsqueeze(-1)
+        if "depth_valid" in data:
+            depth_valid = data["depth_valid"]
+            if isinstance(depth_valid, torch.Tensor):
+                depth_valid = depth_valid.numpy().astype(np.uint8)
+            if depth_valid.ndim == 3:
+                depth_valid = depth_valid[:, :, 0]
+            depth_valid = cv2.remap(depth_valid.astype(np.float32), map1, map2, interpolation=cv2.INTER_NEAREST)
+            data["depth_valid"] = torch.from_numpy(depth_valid > 0).unsqueeze(-1).bool()
         if "mask" in data:
             mask = data["mask"].numpy()
             mask = mask.astype(np.uint8) * 255

@@ -19,6 +19,8 @@ from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.cameras.cameras import Cameras
 
 from street_gaussians_ns.data.utils.data_utils import (
+    get_depth_image_from_path,
+    get_depth_valid_from_path,
     get_image_mask_tensor_from_path,
     get_semantics_and_mask_tensors_from_path,
 )
@@ -32,7 +34,7 @@ class InputDataset(Dataset):
         scale_factor: The scaling factor for the dataparser outputs
     """
 
-    exclude_batch_keys_from_device: List[str] = ["image", "mask"]
+    exclude_batch_keys_from_device: List[str] = ["image", "mask", "depth", "depth_valid"]
     cameras: Cameras
 
     def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0):
@@ -128,6 +130,27 @@ class InputDataset(Dataset):
             assert (
                 data["semantic"].shape[:2] == data["image"].shape[:2]
             ), f"Semantic and image have different shapes. Got {data['semantic'].shape[:2]} and {data['image'].shape[:2]}"
+        if depth_filenames := self._dataparser_outputs.metadata.get("depth_filenames"):
+            depth_filename = depth_filenames[image_idx]
+            if depth_filename is not None and depth_filename.exists():
+                h, w = data["image"].shape[:2]
+                depth = get_depth_image_from_path(
+                    filepath=depth_filename,
+                    height=h,
+                    width=w,
+                    scale_factor=self._dataparser_outputs.dataparser_scale * self.scale_factor,
+                )
+                depth_valid = get_depth_valid_from_path(
+                    filepath=depth_filename,
+                    height=h,
+                    width=w,
+                    scale_factor=self.scale_factor,
+                )
+                data["depth"] = depth
+                data["depth_valid"] = depth_valid
+                assert (
+                    data["depth"].shape[:2] == data["image"].shape[:2]
+                ), f"Depth and image have different shapes. Got {data['depth'].shape[:2]} and {data['image'].shape[:2]}"
         if self.mask_color:
             data["image"] = torch.where(
                 data["mask"] == 1.0, data["image"], torch.ones_like(data["image"]) * torch.tensor(self.mask_color)
