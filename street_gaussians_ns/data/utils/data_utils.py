@@ -89,28 +89,17 @@ def get_depth_image_from_path(
         interpolation: Depth value interpolation for resizing.
 
     Returns:
-        Depth image torch tensor with shape [height, width, 1].
+        Depth image torch tensor with shape [height, width, 1] (float32).
     """
-    if filepath.suffix == ".npy":
-        image = np.load(filepath) * scale_factor
-        image = cv2.resize(image, (width, height), interpolation=interpolation)
-    elif filepath.suffix == ".npz":
-        data = np.load(filepath)
-        if "depth" in data:
-            image = data["depth"].astype(np.float64)
-        else:
-            image = data["arr_0"].astype(np.float64)
-        image = cv2.resize(image, (width, height), interpolation=interpolation)
-    elif depth_type == "2x8bit" or filepath.suffix == ".png":
-        depth_img = cv2.imread(str(filepath.absolute()))
-        image = depth_img[:,:,0] + (depth_img[:,:,1] * 256)
-        image=image.astype(np.float64) * scale_factor * 0.01
-        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_NEAREST)
-    else:
-        image = cv2.imread(str(filepath.absolute()), cv2.IMREAD_ANYDEPTH)
-        image = image.astype(np.float64) * scale_factor
-        image = cv2.resize(image, (width, height), interpolation=interpolation)
-    return torch.from_numpy(image).unsqueeze(-1)
+    depth, _ = get_depth_and_valid_from_path(
+        filepath=filepath,
+        height=height,
+        width=width,
+        depth_scale_factor=scale_factor,
+        interpolation=interpolation,
+        depth_type=depth_type,
+    )
+    return depth
 
 
 def get_depth_valid_from_path(
@@ -121,15 +110,51 @@ def get_depth_valid_from_path(
     interpolation: int = cv2.INTER_NEAREST,
 ) -> torch.Tensor:
     """Load depth validity mask from npz (key: valid) or infer from depth > 0."""
+    _, valid = get_depth_and_valid_from_path(
+        filepath=filepath,
+        height=height,
+        width=width,
+        depth_scale_factor=scale_factor,
+        interpolation=interpolation,
+    )
+    return valid
+
+
+def get_depth_and_valid_from_path(
+    filepath: Path,
+    height: int,
+    width: int,
+    depth_scale_factor: float = 1,
+    interpolation: int = cv2.INTER_NEAREST,
+    depth_type=None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Load depth and validity in one file read. Returns float32 depth and bool valid mask."""
     if filepath.suffix == ".npz":
-        data = np.load(filepath)
-        if "valid" in data:
-            valid = data["valid"].astype(np.float32)
-        else:
-            depth_key = "depth" if "depth" in data else "arr_0"
-            valid = (data[depth_key] > 0).astype(np.float32)
+        with np.load(filepath) as data:
+            if "depth" in data:
+                depth = data["depth"].astype(np.float32) * depth_scale_factor
+            else:
+                depth = data["arr_0"].astype(np.float32) * depth_scale_factor
+            if "valid" in data:
+                valid = data["valid"].astype(np.float32)
+            else:
+                valid = (depth > 0).astype(np.float32)
+        depth = cv2.resize(depth, (width, height), interpolation=interpolation)
         valid = cv2.resize(valid, (width, height), interpolation=interpolation)
-        return torch.from_numpy(valid).unsqueeze(-1).bool()
-    depth = get_depth_image_from_path(filepath, height, width, scale_factor, interpolation)
-    return depth > 0
+        return torch.from_numpy(depth).unsqueeze(-1), torch.from_numpy(valid > 0).unsqueeze(-1).bool()
+
+    if filepath.suffix == ".npy":
+        depth = np.load(filepath).astype(np.float32) * depth_scale_factor
+        depth = cv2.resize(depth, (width, height), interpolation=interpolation)
+    elif depth_type == "2x8bit" or filepath.suffix == ".png":
+        depth_img = cv2.imread(str(filepath.absolute()))
+        depth = depth_img[:, :, 0] + (depth_img[:, :, 1] * 256)
+        depth = depth.astype(np.float32) * depth_scale_factor * 0.01
+        depth = cv2.resize(depth, (width, height), interpolation=cv2.INTER_NEAREST)
+    else:
+        depth = cv2.imread(str(filepath.absolute()), cv2.IMREAD_ANYDEPTH)
+        depth = depth.astype(np.float32) * depth_scale_factor
+        depth = cv2.resize(depth, (width, height), interpolation=interpolation)
+    depth_tensor = torch.from_numpy(depth).unsqueeze(-1)
+    return depth_tensor, depth_tensor > 0
 

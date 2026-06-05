@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -19,8 +19,7 @@ from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.cameras.cameras import Cameras
 
 from street_gaussians_ns.data.utils.data_utils import (
-    get_depth_image_from_path,
-    get_depth_valid_from_path,
+    get_depth_and_valid_from_path,
     get_image_mask_tensor_from_path,
     get_semantics_and_mask_tensors_from_path,
 )
@@ -101,12 +100,33 @@ class InputDataset(Dataset):
             image = torch.clamp(image, min=0, max=255).to(torch.uint8)
         return image
 
-    def get_data(self, image_idx: int, image_type: Literal["uint8", "float32"] = "float32") -> Dict:
+    def get_depth_tensors(self, image_idx: int, height: int, width: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load depth and validity for one frame (lazy, not cached with RGB)."""
+        depth_filenames = self._dataparser_outputs.metadata.get("depth_filenames")
+        if depth_filenames is None:
+            raise ValueError("depth_filenames not found in dataparser metadata")
+        depth_filename = depth_filenames[image_idx]
+        if depth_filename is None or not depth_filename.exists():
+            raise FileNotFoundError(f"Depth file not found for image index {image_idx}: {depth_filename}")
+        return get_depth_and_valid_from_path(
+            filepath=depth_filename,
+            height=height,
+            width=width,
+            depth_scale_factor=self._dataparser_outputs.dataparser_scale * self.scale_factor,
+        )
+
+    def get_data(
+        self,
+        image_idx: int,
+        image_type: Literal["uint8", "float32"] = "float32",
+        load_depth: bool = False,
+    ) -> Dict:
         """Returns the ImageDataset data as a dictionary.
 
         Args:
             image_idx: The image index in the dataset.
             image_type: the type of images returned
+            load_depth: If True, load depth immediately. Default False so depth is lazy-loaded at train time.
         """
         if image_type == "float32":
             image = self.get_image_float32(image_idx)
@@ -130,27 +150,14 @@ class InputDataset(Dataset):
             assert (
                 data["semantic"].shape[:2] == data["image"].shape[:2]
             ), f"Semantic and image have different shapes. Got {data['semantic'].shape[:2]} and {data['image'].shape[:2]}"
-        if depth_filenames := self._dataparser_outputs.metadata.get("depth_filenames"):
-            depth_filename = depth_filenames[image_idx]
-            if depth_filename is not None and depth_filename.exists():
-                h, w = data["image"].shape[:2]
-                depth = get_depth_image_from_path(
-                    filepath=depth_filename,
-                    height=h,
-                    width=w,
-                    scale_factor=self._dataparser_outputs.dataparser_scale * self.scale_factor,
-                )
-                depth_valid = get_depth_valid_from_path(
-                    filepath=depth_filename,
-                    height=h,
-                    width=w,
-                    scale_factor=self.scale_factor,
-                )
-                data["depth"] = depth
-                data["depth_valid"] = depth_valid
-                assert (
-                    data["depth"].shape[:2] == data["image"].shape[:2]
-                ), f"Depth and image have different shapes. Got {data['depth'].shape[:2]} and {data['image'].shape[:2]}"
+        if load_depth and self._dataparser_outputs.metadata.get("depth_filenames") is not None:
+            h, w = data["image"].shape[:2]
+            depth, depth_valid = self.get_depth_tensors(image_idx, h, w)
+            data["depth"] = depth
+            data["depth_valid"] = depth_valid
+            assert (
+                data["depth"].shape[:2] == data["image"].shape[:2]
+            ), f"Depth and image have different shapes. Got {data['depth'].shape[:2]} and {data['image'].shape[:2]}"
         if self.mask_color:
             data["image"] = torch.where(
                 data["mask"] == 1.0, data["image"], torch.ones_like(data["image"]) * torch.tensor(self.mask_color)

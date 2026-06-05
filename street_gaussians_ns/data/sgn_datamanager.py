@@ -116,6 +116,8 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         self.train_unseen_cameras = [i for i in range(len(self.train_dataset))]
         self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
         assert len(self.train_unseen_cameras) > 0, "No data found in dataset"
+        self._train_depth_undistort_ctx: List[Optional[dict]] = []
+        self._eval_depth_undistort_ctx: List[Optional[dict]] = []
 
         super().__init__()
 
@@ -144,15 +146,16 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         else:
             assert_never(split)
 
-        def undistort_idx(idx: int) -> Dict[str, torch.Tensor]:
-            data = dataset.get_data(idx, image_type=self.config.cache_images_type)
+        def undistort_idx(idx: int) -> Tuple[Dict[str, torch.Tensor], Optional[dict]]:
+            data = dataset.get_data(idx, image_type=self.config.cache_images_type, load_depth=False)
+            depth_ctx: Optional[dict] = None
             camera = dataset.cameras[idx].reshape(())
             assert data["image"].shape[1] == camera.width.item() and data["image"].shape[0] == camera.height.item(), (
                 f'The size of image ({data["image"].shape[1]}, {data["image"].shape[0]}) loaded '
                 f'does not match the camera parameters ({camera.width.item(), camera.height.item()})'
             )
             if camera.distortion_params is None:
-                return data
+                return data, depth_ctx
             if camera.camera_type.item() == CameraType.FISHEYE.value:
                 dataparser = getattr(self, "dataparser", None)
                 undistort_fisheye = (
@@ -161,11 +164,18 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
                     else False
                 )
                 if not undistort_fisheye:
-                    return data
+                    return data, depth_ctx
             K = camera.get_intrinsics_matrices().numpy()
             distortion_params = camera.distortion_params.numpy()
             image = data["image"].numpy()
 
+            depth_ctx = {
+                "source_height": int(data["image"].shape[0]),
+                "source_width": int(data["image"].shape[1]),
+                "camera_type": int(camera.camera_type.item()),
+                "K": K.copy(),
+                "distortion_params": distortion_params.copy(),
+            }
             K, image, mask = _undistort_image(camera, distortion_params, data, image, K)
             data["image"] = torch.from_numpy(image)
             if mask is not None:
@@ -177,11 +187,13 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             dataset.cameras.cy[idx] = float(K[1, 2])
             dataset.cameras.width[idx] = image.shape[1]
             dataset.cameras.height[idx] = image.shape[0]
-            return data
+            data.pop("depth", None)
+            data.pop("depth_valid", None)
+            return data, depth_ctx
 
         CONSOLE.log(f"Caching / undistorting {split} images")
         with ThreadPoolExecutor(max_workers=2) as executor:
-            undistorted_images = list(
+            load_results = list(
                 track(
                     executor.map(
                         undistort_idx,
@@ -192,6 +204,8 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
                     total=len(dataset),
                 )
             )
+        undistorted_images = [result[0] for result in load_results]
+        depth_undistort_ctxs = [result[1] for result in load_results]
 
         # Move to device.
         if cache_images_device == "gpu":
@@ -207,7 +221,74 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         else:
             assert_never(cache_images_device)
 
+        if split == "train":
+            self._train_depth_undistort_ctx = depth_undistort_ctxs
+        else:
+            self._eval_depth_undistort_ctx = depth_undistort_ctxs
+
         return undistorted_images
+
+    def _has_depth(self, dataset: TDataset) -> bool:
+        depth_filenames = dataset._dataparser_outputs.metadata.get("depth_filenames")
+        return depth_filenames is not None and any(
+            filename is not None and filename.exists() for filename in depth_filenames
+        )
+
+    def _lazy_load_depth(
+        self,
+        split: Literal["train", "eval"],
+        image_idx: int,
+        dataset: TDataset,
+        cached_data: Dict[str, torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not self._has_depth(dataset):
+            return None, None
+        depth_filenames = dataset._dataparser_outputs.metadata["depth_filenames"]
+        depth_filename = depth_filenames[image_idx]
+        if depth_filename is None or not depth_filename.exists():
+            return None, None
+
+        depth_ctx = (
+            self._train_depth_undistort_ctx[image_idx]
+            if split == "train"
+            else self._eval_depth_undistort_ctx[image_idx]
+        )
+        if depth_ctx is None:
+            height, width = cached_data["image"].shape[:2]
+            depth, depth_valid = dataset.get_depth_tensors(image_idx, height, width)
+            return depth, depth_valid
+
+        depth, depth_valid = dataset.get_depth_tensors(
+            image_idx, depth_ctx["source_height"], depth_ctx["source_width"]
+        )
+        return _undistort_depth_tensors(
+            depth=depth,
+            depth_valid=depth_valid,
+            camera_type=depth_ctx["camera_type"],
+            K=depth_ctx["K"],
+            distortion_params=depth_ctx["distortion_params"],
+        )
+
+    def _materialize_batch(
+        self,
+        split: Literal["train", "eval"],
+        image_idx: int,
+    ) -> Dict[str, torch.Tensor]:
+        cache = self.cached_train if split == "train" else self.cached_eval
+        dataset = self.train_dataset if split == "train" else self.eval_dataset
+        cached = cache[image_idx]
+        data: Dict[str, torch.Tensor] = {"image_idx": cached["image_idx"]}
+        data["image"] = cached["image"].to(self.device)
+        if "mask" in cached:
+            data["mask"] = cached["mask"].to(self.device)
+        if "semantic" in cached:
+            data["semantic"] = cached["semantic"].to(self.device)
+        depth, depth_valid = self._lazy_load_depth(split, image_idx, dataset, cached)
+        if depth is not None:
+            data["depth"] = depth.to(self.device)
+        if depth_valid is not None:
+            data["depth_valid"] = depth_valid.to(self.device)
+        return data
 
     def create_train_dataset(self) -> TDataset:
         """Sets up the data loaders for training"""
@@ -267,15 +348,7 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         _cameras = deepcopy(self.eval_dataset.cameras).to(self.device)
         cameras = []
         for i in image_indices:
-            data[i]["image"] = data[i]["image"].to(self.device)
-            if "mask" in data[i]:
-                data[i]["mask"] = data[i]["mask"].to(self.device)
-            if "semantic" in data[i]:
-                data[i]["semantic"] = data[i]["semantic"].to(self.device)
-            if "depth" in data[i]:
-                data[i]["depth"] = data[i]["depth"].to(self.device)
-            if "depth_valid" in data[i]:
-                data[i]["depth_valid"] = data[i]["depth_valid"].to(self.device)
+            data[i] = self._materialize_batch("eval", i)
             cameras.append(_cameras[i : i + 1])
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         return list(zip(cameras, data))
@@ -300,16 +373,7 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         if len(self.train_unseen_cameras) == 0:
             self.train_unseen_cameras = [i for i in range(len(self.train_dataset))]
 
-        data = deepcopy(self.cached_train[image_idx])
-        data["image"] = data["image"].to(self.device)
-        if "mask" in data:
-            data["mask"] = data["mask"].to(self.device)
-        if "semantic" in data:
-            data["semantic"] = data["semantic"].to(self.device)
-        if "depth" in data:
-            data["depth"] = data["depth"].to(self.device)
-        if "depth_valid" in data:
-            data["depth_valid"] = data["depth_valid"].to(self.device)
+        data = self._materialize_batch("train", image_idx)
         assert len(self.train_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.train_dataset.cameras[image_idx : image_idx + 1].to(self.device)
         if camera.metadata is None:
@@ -325,16 +389,7 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         # Make sure to re-populate the unseen cameras list if we have exhausted it
         if len(self.eval_unseen_cameras) == 0:
             self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
-        data = deepcopy(self.cached_eval[image_idx])
-        data["image"] = data["image"].to(self.device)
-        if "mask" in data:
-            data["mask"] = data["mask"].to(self.device)
-        if "semantic" in data:
-            data["semantic"] = data["semantic"].to(self.device)
-        if "depth" in data:
-            data["depth"] = data["depth"].to(self.device)
-        if "depth_valid" in data:
-            data["depth_valid"] = data["depth_valid"].to(self.device)
+        data = self._materialize_batch("eval", image_idx)
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
         return camera, data
@@ -349,19 +404,80 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         # Make sure to re-populate the unseen cameras list if we have exhausted it
         if len(self.eval_unseen_cameras) == 0:
             self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
-        data = deepcopy(self.cached_eval[image_idx])
-        data["image"] = data["image"].to(self.device)
-        if "mask" in data:
-            data["mask"] = data["mask"].to(self.device)
-        if "semantic" in data:
-            data["semantic"] = data["semantic"].to(self.device)
-        if "depth" in data:
-            data["depth"] = data["depth"].to(self.device)
-        if "depth_valid" in data:
-            data["depth_valid"] = data["depth_valid"].to(self.device)
+        data = self._materialize_batch("eval", image_idx)
         assert len(self.eval_dataset.cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
         return camera, data
+
+
+def _undistort_depth_tensors(
+    depth: torch.Tensor,
+    depth_valid: torch.Tensor,
+    camera_type: int,
+    K: np.ndarray,
+    distortion_params: np.ndarray,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Undistort depth and validity tensors using the same logic as _undistort_image."""
+    depth_np = depth.detach().cpu().numpy()
+    if depth_np.ndim == 3:
+        depth_np = depth_np[:, :, 0]
+    valid_np = depth_valid.detach().cpu().numpy().astype(np.uint8)
+    if valid_np.ndim == 3:
+        valid_np = valid_np[:, :, 0]
+
+    if camera_type == CameraType.PERSPECTIVE.value:
+        assert distortion_params[3] == 0, (
+            "We doesn't support the 4th Brown parameter for image undistortion, "
+            "Only k1, k2, k3, p1, p2 can be non-zero."
+        )
+        opencv_distortion = np.array(
+            [
+                distortion_params[0],
+                distortion_params[1],
+                distortion_params[4],
+                distortion_params[5],
+                distortion_params[2],
+                distortion_params[3],
+                0,
+                0,
+            ]
+        )
+        K = K.copy()
+        K[0, 2] = K[0, 2] - 0.5
+        K[1, 2] = K[1, 2] - 0.5
+        if np.any(opencv_distortion):
+            newK, roi = cv2.getOptimalNewCameraMatrix(
+                K, opencv_distortion, (depth_np.shape[1], depth_np.shape[0]), 0
+            )
+            depth_np = cv2.undistort(depth_np.astype(np.float32), K, opencv_distortion, None, newK)
+            valid_np = cv2.undistort(valid_np.astype(np.float32), K, opencv_distortion, None, newK)
+        else:
+            roi = 0, 0, depth_np.shape[1], depth_np.shape[0]
+        x, y, w, h = roi
+        depth_np = depth_np[y : y + h, x : x + w]
+        valid_np = valid_np[y : y + h, x : x + w]
+    elif camera_type == CameraType.FISHEYE.value:
+        K = K.copy()
+        K[0, 2] = K[0, 2] - 0.5
+        K[1, 2] = K[1, 2] - 0.5
+        fisheye_distortion = np.array(
+            [distortion_params[0], distortion_params[1], distortion_params[2], distortion_params[3]]
+        )
+        newK = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K, fisheye_distortion, (depth_np.shape[1], depth_np.shape[0]), np.eye(3), balance=0
+        )
+        map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+            K, fisheye_distortion, np.eye(3), newK, (depth_np.shape[1], depth_np.shape[0]), cv2.CV_32FC1
+        )
+        depth_np = cv2.remap(depth_np.astype(np.float32), map1, map2, interpolation=cv2.INTER_NEAREST)
+        valid_np = cv2.remap(valid_np.astype(np.float32), map1, map2, interpolation=cv2.INTER_NEAREST)
+    else:
+        raise NotImplementedError("Lazy depth undistortion only supports perspective and fisheye cameras")
+
+    return (
+        torch.from_numpy(depth_np).unsqueeze(-1),
+        torch.from_numpy(valid_np > 0).unsqueeze(-1).bool(),
+    )
 
 
 def _undistort_image(
