@@ -57,7 +57,7 @@ from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils import colormaps
-from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.model_components.lib_bilagrid import BilateralGrid, slice, total_variation_loss, color_correct
 
 from street_gaussians_ns.data.utils.data_utils import SemanticType
@@ -860,8 +860,17 @@ class SplatfactoModel(Model):
             return TF.resize(image.permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
         return image
 
-    def _uses_3dgut_render(self) -> bool:
-        return self.config.render_camera_model in ("fisheye", "ftheta")
+    def _uses_3dgut_render(self, camera: Optional[Cameras] = None) -> bool:
+        if self.config.render_camera_model in ("fisheye", "ftheta"):
+            return True
+        if camera is not None and camera.camera_type.item() == CameraType.FISHEYE.value:
+            return True
+        return False
+
+    def _get_3dgut_camera_model(self, camera: Cameras) -> Literal["fisheye", "ftheta"]:
+        if camera.camera_type.item() == CameraType.FISHEYE.value:
+            return "fisheye"
+        return self.config.render_camera_model  # type: ignore[return-value]
 
     def _get_ftheta_coeffs(self):
         if not hasattr(self, "_ftheta_coeffs_cache"):
@@ -934,7 +943,7 @@ class SplatfactoModel(Model):
         cy = camera.cy.item()
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
-        use_3dgut = self._uses_3dgut_render()
+        use_3dgut = self._uses_3dgut_render(camera)
 
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]
@@ -1066,10 +1075,11 @@ class SplatfactoModel(Model):
 
         alpha: Optional[torch.Tensor] = None
 
-        if self._uses_3dgut_render():
+        if self._uses_3dgut_render(camera):
             need_depth = "depth" in output_names
             gs_render_mode: Literal["RGB", "RGB+D"] = "RGB+D" if need_depth else "RGB"
-            ftheta_coeffs = self._get_ftheta_coeffs() if self.config.render_camera_model == "ftheta" else None
+            gut_camera_model = self._get_3dgut_camera_model(camera)
+            ftheta_coeffs = self._get_ftheta_coeffs() if gut_camera_model == "ftheta" else None
             distortion = camera.distortion_params[0] if camera.distortion_params is not None else None
             rgb, alpha, depth_im = rasterize_gaussians_3dgut(
                 means=means,
@@ -1084,7 +1094,7 @@ class SplatfactoModel(Model):
                 cy=camera.cy.item(),
                 img_height=H,
                 img_width=W,
-                camera_model=self.config.render_camera_model,  # type: ignore[arg-type]
+                camera_model=gut_camera_model,
                 distortion_params=distortion,
                 ftheta_coeffs=ftheta_coeffs,
                 background=background,

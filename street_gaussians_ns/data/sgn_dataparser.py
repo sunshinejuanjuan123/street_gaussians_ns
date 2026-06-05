@@ -101,6 +101,8 @@ class ColmapDataParserConfig(DataParserConfig):
     """Maximum number of 2D matches per 3D point. If set to -1, all 2D matches are loaded. If set to 0, no 2D matches are loaded."""
     undistort: bool = False
     """If true, undistort data in advance."""
+    undistort_fisheye: bool = False
+    """If false, keep OPENCV_FISHEYE images distorted for gsplat fisheye training/rendering."""
     force_save_undistort_data: Tuple[Literal["all", "image", "mask", "depth", "semantic", "normal"], ...] = ()
     """The specified data will be forcely saved or updated after undistorting."""
     load_dynamic_annotations: bool = False
@@ -621,9 +623,17 @@ class ColmapDataParser(DataParser):
             )
         CONSOLE.log("[bold green]:tada: Done downscaling images.")
 
+    def _effective_undistort_for_camera(self, camera: Cameras) -> bool:
+        if not self.config.undistort:
+            return False
+        if camera.camera_type.item() == CameraType.FISHEYE.value and not self.config.undistort_fisheye:
+            return False
+        return True
+
     def _downscale_and_undistort_one(self, camera: Cameras, filename):
         assert len(camera.shape) == 0
-        
+        effective_undistort = self._effective_undistort_for_camera(camera)
+
         width, height = imagesize.get(filename["image"])
         width = width // self._downscale_factor
         height = height // self._downscale_factor
@@ -633,7 +643,7 @@ class ColmapDataParser(DataParser):
         for key, path, filename in contents:
             if filename is None:
                 continue
-            out = self._get_fname(self.config.data / path, filename)
+            out = self._get_fname(self.config.data / path, filename, undistort=effective_undistort)
             if "all" not in self.config.force_save_undistort_data and key not in self.config.force_save_undistort_data and out.exists():
                 continue
             assert filename.suffix in (".png", ".jpg")
@@ -644,7 +654,7 @@ class ColmapDataParser(DataParser):
                 )
             data[key] = value
 
-        if self.config.undistort:
+        if effective_undistort:
             if camera.distortion_params is not None and camera.distortion_params.abs().sum() > 0:
                 K = camera.get_intrinsics_matrices().numpy()
                 distortion_params = camera.distortion_params.numpy()
@@ -721,7 +731,7 @@ class ColmapDataParser(DataParser):
         for key, path, filename in contents:
             if key not in data:
                 continue
-            out = self._get_fname(self.config.data / path, filename)
+            out = self._get_fname(self.config.data / path, filename, undistort=effective_undistort)
             out.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(out.as_posix(), data[key])
 
@@ -781,7 +791,14 @@ class ColmapDataParser(DataParser):
 
         for channel, filelist in filenames.items():
             assert self.channel_path[channel] is not None
-            filenames[channel] = [self._get_fname(self.config.data / self.channel_path[channel], fp) for fp in filelist]
+            filenames[channel] = [
+                self._get_fname(
+                    self.config.data / self.channel_path[channel],
+                    fp,
+                    undistort=self._effective_undistort_for_camera(camera_list[i]),
+                )
+                for i, fp in enumerate(filelist)
+            ]
         
         return cameras, filenames, self._downscale_factor
 

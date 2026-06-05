@@ -153,6 +153,15 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             )
             if camera.distortion_params is None:
                 return data
+            if camera.camera_type.item() == CameraType.FISHEYE.value:
+                dataparser = getattr(self, "dataparser", None)
+                undistort_fisheye = (
+                    getattr(getattr(dataparser, "config", None), "undistort_fisheye", False)
+                    if dataparser is not None
+                    else False
+                )
+                if not undistort_fisheye:
+                    return data
             K = camera.get_intrinsics_matrices().numpy()
             distortion_params = camera.distortion_params.numpy()
             image = data["image"].numpy()

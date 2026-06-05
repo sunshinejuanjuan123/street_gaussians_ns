@@ -288,7 +288,7 @@ class SplatfactoSceneGraphModel(SplatfactoModel):
             "opacities": submodel_opacities,
             "viewmat": viewmat,
         }
-        if self._uses_3dgut_render():
+        if self._uses_3dgut_render(camera):
             submodel_quats = self.aggregate_submodel_var("quats", submodel_names)
             submodel_scales = self.aggregate_submodel_var("scales", submodel_names)
             gaussian_attrs["quats"] = submodel_quats / submodel_quats.norm(dim=-1, keepdim=True)
