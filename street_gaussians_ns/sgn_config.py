@@ -22,10 +22,10 @@ import os
 env_value = os.getenv("STREET_GAUSSIANS_MAX_ITERATIONS", "").strip()
 
 try:
-    STREET_GAUSSIANS_MAX_ITERATIONS = int(env_value) if env_value else 30000
+    STREET_GAUSSIANS_MAX_ITERATIONS = int(env_value) if env_value else 70000
 except ValueError:
-    print(f"Warning: Invalid STREET_GAUSSIANS_MAX_ITERATIONS='{env_value}', using default value 30000.")
-    STREET_GAUSSIANS_MAX_ITERATIONS = 30000
+    print(f"Warning: Invalid STREET_GAUSSIANS_MAX_ITERATIONS='{env_value}', using default value 70000.")
+    STREET_GAUSSIANS_MAX_ITERATIONS = 70000
 
 print(f"3DGS: STREET_GAUSSIANS_MAX_ITERATIONS={STREET_GAUSSIANS_MAX_ITERATIONS}")
 
