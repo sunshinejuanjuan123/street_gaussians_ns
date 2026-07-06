@@ -5,6 +5,7 @@ NeRF implementation that combines many recent advancements.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type, Union
@@ -350,7 +351,37 @@ class SplatfactoModel(Model):
             features_dc[:, 0, :3] = torch.rand(num_points, 3)
             # self.features_dc = torch.nn.Parameter(features_dc)
             features_rest = torch.zeros((num_points, dim_sh - 1, 3))
-        
+
+        if self._model_idx_in_scene_graph == 0:
+            background_ckpt = os.environ.get(
+                "BACKGROUND_INIT_CKPT",
+                "/mnt/iag/yuanweizhong/datasets/case_2/3dgs_format_v1/v_new_anno/street-gaussians-ns/2026-03-31_012414/nerfstudio_models/step-000069999.ckpt",
+            )
+            ckpt_path = Path(background_ckpt)
+            # if ckpt_path.exists():
+            #     CONSOLE.log(f"Loading background model from {ckpt_path}")
+            #     try:
+            #         pre_init_model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            #     except TypeError:
+            #         pre_init_model = torch.load(ckpt_path, map_location="cpu")
+            #     ckpt_pipeline = pre_init_model["pipeline"]
+
+            #     def get_ckpt_tensor(name: str) -> torch.Tensor:
+            #         key = f"_model.all_models.background.gauss_params.{name}"
+            #         if key not in ckpt_pipeline:
+            #             raise KeyError(f"Missing key in ckpt: {key}")
+            #         return ckpt_pipeline[key]
+
+            #     device = means.device
+            #     means = torch.nn.Parameter(get_ckpt_tensor("means").to(device))
+            #     scales = torch.nn.Parameter(get_ckpt_tensor("scales").to(device))
+            #     quats = torch.nn.Parameter(get_ckpt_tensor("quats").to(device))
+            #     opacities = torch.nn.Parameter(get_ckpt_tensor("opacities").to(device))
+            #     features_dc = get_ckpt_tensor("features_dc").to(device)
+            #     features_rest = get_ckpt_tensor("features_rest").to(device)
+            #     num_points = means.shape[0]
+            #     dim_sh = num_sh_bases(self.config.sh_degree)
+
         self.gauss_params = torch.nn.ParameterDict(
             {
                 "means": means,
@@ -873,9 +904,14 @@ class SplatfactoModel(Model):
         return image
 
     def _uses_3dgut_render(self, camera: Optional[Cameras] = None) -> bool:
+        # gsplat 3DGUT backward does not implement viewmats gradients; incompatible with SO3xR3.
+        if getattr(self.config.camera_optimizer, "mode", "off") not in (None, "off"):
+            return False
         if self.config.render_camera_model in ("fisheye", "ftheta"):
             return True
         if camera is not None and camera.camera_type.item() == CameraType.FISHEYE.value:
+            if camera.distortion_params is not None and camera.distortion_params.abs().sum() < 1e-3:
+                return False
             return True
         return False
 

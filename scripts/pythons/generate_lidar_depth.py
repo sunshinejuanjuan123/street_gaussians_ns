@@ -19,6 +19,7 @@ if _sfm_tools_root.exists():
     sys.path.insert(0, str(_sfm_tools_root))
 
 from feature_extract_match.model.read_write_model import read_model
+from combine_lidar_sfm_points import collect_frame_lidar_points, load_gt_jsonl
 
 
 def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
@@ -106,6 +107,12 @@ def main() -> None:
     parser.add_argument("--colmap_subdir", default="colmap/sparse/0", help="Colmap sparse model path relative to gs_data_root")
     parser.add_argument("--output_subdir", default="depths", help="Output depth directory relative to gs_data_root")
     parser.add_argument("--max_points", type=int, default=50000, help="Max LiDAR points per frame")
+    parser.add_argument(
+        "--lidar_names",
+        nargs="+",
+        default=None,
+        help="only use these lidar sensors (e.g. top_center_lidar); default: all",
+    )
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -115,6 +122,7 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     uniscene = json.load(open(data_root / "plannerGt/unisceneproto.json", "r"))
+    gt_frames = load_gt_jsonl(str(data_root))
     pose_lookup = build_pose_lookup(uniscene)
     cameras, images, _ = read_model(sparse_dir, ext=".bin")
 
@@ -130,18 +138,27 @@ def main() -> None:
             continue
 
         lidar2enu = pose_lookup[timestamp]
-        lidar_abs_path = data_root / sensor_info["lidar_data"][0]["file_path"]
-        if not lidar_abs_path.exists():
+        gt_frame = gt_frames[sensor_info["frame_id"]]
+        lidar_entries = sensor_info["lidar_data"]
+        if args.lidar_names:
+            allowed = set(args.lidar_names)
+            lidar_entries = [
+                e for e in lidar_entries
+                if any(name in e.get("file_path", "") for name in allowed)
+            ]
+        num_lidars = max(len(lidar_entries), 1)
+        per_lidar = max(args.max_points // num_lidars, 1000)
+        points_enu = collect_frame_lidar_points(
+            str(data_root),
+            gt_frame,
+            sensor_info,
+            lidar2enu,
+            max_points_per_lidar=per_lidar,
+            lidar_names=args.lidar_names,
+        )
+        if points_enu.shape[0] == 0:
             skipped += 1
             continue
-
-        points = load_lidar_points(str(lidar_abs_path), max_points=args.max_points)
-        if points.shape[0] == 0:
-            skipped += 1
-            continue
-
-        homogeneous = np.hstack([points, np.ones((points.shape[0], 1))])
-        points_enu = (lidar2enu @ homogeneous.T).T[:, :3]
 
         for image_id, image in images.items():
             cam_name, image_name = image.name.split("/")

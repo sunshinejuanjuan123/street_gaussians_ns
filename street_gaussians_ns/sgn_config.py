@@ -17,6 +17,9 @@ from street_gaussians_ns.data.utils.bbox_optimizers import BBoxOptimizerConfig
 from street_gaussians_ns.sgn_splatfacto import SplatfactoModelConfig
 from street_gaussians_ns.sgn_splatfacto_scene_graph import SplatfactoSceneGraphModelConfig
 
+# PyTorch 2.6+ requires weights_only=False for nerfstudio .ckpt resume
+import street_gaussians_ns.utils.eval_utils  # noqa: F401, E402
+
 import os
 
 env_value = os.getenv("STREET_GAUSSIANS_MAX_ITERATIONS", "").strip()

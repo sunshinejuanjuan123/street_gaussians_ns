@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import time
 import tqdm
 from dataclasses import dataclass, field
 from functools import partial
@@ -131,6 +133,28 @@ def _resolve_dynamic_lidar_dir(data: Path) -> Optional[Path]:
     return None
 
 
+def _agent_log(hypothesis_id: str, location: str, message: str, data: Dict) -> None:
+    try:
+        with open("/mnt/iag/yuanweizhong/.cursor/debug-99838d.log", "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "sessionId": "99838d",
+                        "runId": os.environ.get("CURSOR_DEBUG_RUN_ID", "initial"),
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(time.time() * 1000),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
+
 class ColmapDataParser(DataParser):
     """COLMAP DatasetParser.
     Expects a folder with the following structure:
@@ -221,7 +245,7 @@ class ColmapDataParser(DataParser):
             }
 
             # create time stamp
-            frame["time"] = float(im_data.name.split("/")[-1][:-4])
+            frame["time"] = float(im_data.name.split("/")[-1][:-4])/1e9
             frame.update(cameras[im_data.camera_id])
 
             if self.config.masks_path is not None:
@@ -244,7 +268,15 @@ class ColmapDataParser(DataParser):
             camera_model.append(frame["camera_model"])
 
         out = {}
-        frames.sort(key=lambda x: (x["camera_id"], x["time"] if "time" in x else 0, x["file_path"]))
+        sorted_pairs = sorted(
+            zip(frames, camera_model),
+            key=lambda pair: (
+                pair[0]["camera_id"],
+                pair[0]["time"] if "time" in pair[0] else 0,
+                pair[0]["file_path"],
+            ),
+        )
+        frames, camera_model = (list(t) for t in zip(*sorted_pairs))
         out["frames"] = frames
         if self.config.assume_colmap_world_coordinate_convention:
             # world coordinate transform: map colmap gravity guess (-y) to nerfstudio convention (+z)
@@ -266,6 +298,21 @@ class ColmapDataParser(DataParser):
             or (self.config.data / "test_list.txt").exists()
             or (self.config.data / "validation_list.txt").exists()
         )
+        # region agent log
+        _agent_log(
+            "H2,H3,H4",
+            "sgn_dataparser.py:_get_image_indices:271",
+            "image index selection entry",
+            {
+                "split": split,
+                "num_image_filenames": len(image_filenames),
+                "has_split_files_spec": has_split_files_spec,
+                "filter_camera_id": self.config.filter_camera_id,
+                "frame_select": self.config.frame_select,
+                "camera_id_unique": sorted({int(x) for x in camera_ids.tolist()}),
+            },
+        )
+        # endregion
         if (self.config.data / f"{split}_list.txt").exists():
             CONSOLE.log(f"Using {split}_list.txt to get indices for split {split}.")
             with (self.config.data / f"{split}_list.txt").open("r", encoding="utf8") as f:
@@ -300,6 +347,23 @@ class ColmapDataParser(DataParser):
                     end_frame = self.config.frame_select[1] + i * frame_len
                     all_idx_list.extend(range(start_frame, end_frame))
                 all_idx = np.array(all_idx_list, dtype=np.int32)
+                # region agent log
+                _agent_log(
+                    "H1,H4",
+                    "sgn_dataparser.py:_get_image_indices:302",
+                    "frame_select expanded to indices",
+                    {
+                        "split": split,
+                        "filter_camera_id": self.config.filter_camera_id,
+                        "frame_select": self.config.frame_select,
+                        "camera_counts": [int(x) for x in counts.tolist()],
+                        "frame_len_assumed": int(frame_len),
+                        "expanded_idx_len": int(len(all_idx)),
+                        "expanded_idx_head": all_idx[:10].tolist(),
+                        "expanded_idx_tail": all_idx[-10:].tolist() if len(all_idx) > 10 else all_idx.tolist(),
+                    },
+                )
+                # endregion
             else:
                 all_idx = np.arange(len(image_filenames), dtype=np.int32)
             if self.config.filter_camera_id:
@@ -324,6 +388,19 @@ class ColmapDataParser(DataParser):
                 indices = all_idx
             else:
                 raise ValueError(f"Unknown dataparser split {split}")
+        # region agent log
+        _agent_log(
+            "H1,H2,H3,H4",
+            "sgn_dataparser.py:_get_image_indices:335",
+            "image index selection result",
+            {
+                "split": split,
+                "selected_len": int(len(indices)),
+                "selected_head": indices[:10].tolist() if len(indices) > 0 else [],
+                "selected_tail": indices[-10:].tolist() if len(indices) > 10 else (indices.tolist() if len(indices) > 0 else []),
+            },
+        )
+        # endregion
         return indices
 
     def _generate_dataparser_outputs(self, split: str = "train", **kwargs):
@@ -333,8 +410,28 @@ class ColmapDataParser(DataParser):
 
         dataparser_outputs_path = self.config.data/"dataparser_transforms.json"
         meta = self._get_all_images_and_cameras(colmap_path)
+        # region agent log
+        _agent_log(
+            "H2,H4,H5",
+            "sgn_dataparser.py:_generate_dataparser_outputs:342",
+            "dataparser outputs generation start",
+            {
+                "split": split,
+                "data": str(self.config.data),
+                "colmap_path": str(colmap_path),
+                "meta_frames": len(meta["frames"]),
+                "meta_camera_model_len": len(meta["camera_model"]),
+                "filter_camera_id": self.config.filter_camera_id,
+                "frame_select": self.config.frame_select,
+                "downscale_factor_cfg": self.config.downscale_factor,
+                "undistort": self.config.undistort,
+            },
+        )
+        # endregion
 
-        camera_type = torch.tensor([CAMERA_MODEL_TO_TYPE[model].value for model in meta["camera_model"]])
+        camera_type = torch.tensor(
+            [CAMERA_MODEL_TO_TYPE[frame["camera_model"]].value for frame in meta["frames"]]
+        )
         
         filenames = defaultdict(list) 
 

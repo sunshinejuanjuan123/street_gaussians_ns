@@ -7,7 +7,10 @@ paradigm
 
 from __future__ import annotations
 
+import json
 import random
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -36,6 +39,28 @@ from street_gaussians_ns.data.sgn_dataset import InputDataset
 
 
 TDataset = TypeVar("TDataset", bound=InputDataset, default=InputDataset)
+
+
+def _agent_log(hypothesis_id: str, location: str, message: str, data: Dict) -> None:
+    try:
+        with open("/mnt/iag/yuanweizhong/.cursor/debug-99838d.log", "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "sessionId": "99838d",
+                        "runId": os.environ.get("CURSOR_DEBUG_RUN_ID", "initial"),
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(time.time() * 1000),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
 
 @dataclass
 class FullImageDatamanagerConfig(DataManagerConfig):
@@ -100,6 +125,24 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         self.train_dataparser_outputs: DataparserOutputs = self.dataparser.get_dataparser_outputs(split="train")
         self.train_dataset = self.create_train_dataset()
         self.eval_dataset = self.create_eval_dataset()
+        # region agent log
+        _agent_log(
+            "H2,H5",
+            "sgn_datamanager.py:__init__:100",
+            "datamanager datasets materialized",
+            {
+                "test_mode": test_mode,
+                "test_split": self.test_split,
+                "data": str(self.config.data),
+                "dataparser_data": str(getattr(self.config.dataparser, "data", "")),
+                "filter_camera_id": getattr(self.config.dataparser, "filter_camera_id", None),
+                "frame_select": getattr(self.config.dataparser, "frame_select", None),
+                "train_dataset_len": len(self.train_dataset),
+                "eval_dataset_len": len(self.eval_dataset),
+                "train_image_filenames_len": len(self.train_dataparser_outputs.image_filenames),
+            },
+        )
+        # endregion
         if len(self.train_dataset) > 500 and self.config.cache_images == "gpu":
             CONSOLE.print(
                 "Train dataset has over 500 images, overriding cache_images to cpu",
@@ -118,6 +161,7 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         assert len(self.train_unseen_cameras) > 0, "No data found in dataset"
         self._train_depth_undistort_ctx: List[Optional[dict]] = []
         self._eval_depth_undistort_ctx: List[Optional[dict]] = []
+        self._has_depth_cache: Dict[int, bool] = {}
 
         super().__init__()
 
@@ -229,10 +273,18 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         return undistorted_images
 
     def _has_depth(self, dataset: TDataset) -> bool:
+        cache_key = id(dataset)
+        if cache_key in self._has_depth_cache:
+            return self._has_depth_cache[cache_key]
         depth_filenames = dataset._dataparser_outputs.metadata.get("depth_filenames")
-        return depth_filenames is not None and any(
-            filename is not None and filename.exists() for filename in depth_filenames
-        )
+        if depth_filenames is None:
+            result = False
+        else:
+            result = any(
+                filename is not None and filename.exists() for filename in depth_filenames
+            )
+        self._has_depth_cache[cache_key] = result
+        return result
 
     def _lazy_load_depth(
         self,

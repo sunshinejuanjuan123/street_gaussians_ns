@@ -3,7 +3,7 @@
         "camera": "center_camera_fov120",
         "image_path_patten": ".*/center_camera_fov120/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
@@ -13,7 +13,7 @@
         "camera": "center_camera_fov30",
         "image_path_patten": ".*/center_camera_fov30/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
@@ -23,7 +23,7 @@
         "camera": "left_front_camera",
         "image_path_patten": ".*/left_front_camera/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
@@ -33,7 +33,7 @@
         "camera": "left_rear_camera",
         "image_path_patten": ".*/left_rear_camera/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, -1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
@@ -43,7 +43,7 @@
         "camera": "right_front_camera",
         "image_path_patten": ".*/right_front_camera/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
@@ -53,7 +53,7 @@
         "camera": "right_rear_camera",
         "image_path_patten": ".*/right_rear_camera/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, -1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
@@ -63,7 +63,7 @@
         "camera": "rear_camera",
         "image_path_patten": ".*/rear_camera/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, -1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
@@ -73,7 +73,7 @@
         "camera": "front_camera_fov195",
         "image_path_patten": ".*/front_camera_fov195/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
@@ -83,7 +83,7 @@
         "camera": "rear_camera_fov195",
         "image_path_patten": ".*/rear_camera_fov195/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, -1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
@@ -93,7 +93,17 @@
         "camera": "right_camera_fov195",
         "image_path_patten": ".*/right_camera_fov195/.*",
         "transform": [
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ]
+    },
+    {
+        "camera": "left_camera_fov195",
+        "image_path_patten": ".*/left_camera_fov195/.*",
+        "transform": [
+            [1.0, 0.0, 0.0, -1.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
